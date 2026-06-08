@@ -1,0 +1,11 @@
+[package]
+name = "mirlens"
+version = "0.1.0"
+edition = "2021"
+description = "a lens onto each function's MIR"
+
+[[bin]]
+name = "mirlens"
+path = "src/main.rs"
+
+[dependencies]

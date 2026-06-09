@@ -43,10 +43,37 @@ fn walk_terminator(term: &mir::Terminator<'_>) {
     }
 }
 
+fn walk_rvalue(rv: &mir::Rvalue<'_>) {
+    use mir::Rvalue::*;
+    match rv {
+        Use(op, _) => walk_operand(op),
+        Ref(_, _, place) => println!("      &{place:?}"),
+        BinaryOp(op, b) => {
+            println!("      {op:?}");
+            walk_operand(&b.0);
+            walk_operand(&b.1);
+        }
+        other => println!("      {other:?}"),
+    }
+}
+
+fn walk_operand(op: &mir::Operand<'_>) {
+    match op {
+        mir::Operand::Copy(p) => println!("      copy {p:?}"),
+        mir::Operand::Move(p) => println!("      move {p:?}"),
+        mir::Operand::Constant(c) => println!("      const {:?}", c.const_),
+        _ => {}
+    }
+}
+
 fn walk_statement(stmt: &mir::Statement<'_>) {
     use mir::StatementKind::*;
     match &stmt.kind {
-        Assign(b) => println!("    {:?} = {:?}", b.0, b.1),
+        Assign(b) => {
+            let (place, rv) = &**b;
+            println!("    {place:?} =");
+            walk_rvalue(rv);
+        }
         StorageLive(l) => println!("    StorageLive({l:?})"),
         StorageDead(l) => println!("    StorageDead({l:?})"),
         other => println!("    {other:?}"),

@@ -27,6 +27,19 @@ fn analyze<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, body: &mir::Body<'tcx>) {
         for stmt in &data.statements {
             walk_statement(stmt);
         }
+        walk_terminator(data.terminator());
+    }
+}
+
+fn walk_terminator(term: &mir::Terminator<'_>) {
+    use mir::TerminatorKind::*;
+    match &term.kind {
+        Goto { target } => println!("    goto -> {target:?}"),
+        SwitchInt { discr, .. } => println!("    switchInt({discr:?})"),
+        Call { func, .. } => println!("    call {func:?}"),
+        Drop { place, .. } => println!("    drop({place:?})"),
+        Return => println!("    return"),
+        other => println!("    {other:?}"),
     }
 }
 

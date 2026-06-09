@@ -21,10 +21,10 @@ use rustc_middle::ty::TyCtxt;
 
 /// Called once per function, with its MIR.
 fn analyze<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, body: &mir::Body<'tcx>) {
-    println!("\n// MIR for {}", tcx.def_path_str(def_id));
-    let mut out = Vec::new();
-    mir::pretty::MirWriter::new(tcx).write_mir_fn(body, &mut out).unwrap();
-    println!("{}", String::from_utf8_lossy(&out));
+    println!("\nfn {}", tcx.def_path_str(def_id));
+    for (bb, data) in body.basic_blocks.iter_enumerated() {
+        println!("  {bb:?}: {} statements", data.statements.len());
+    }
 }
 
 struct Driver;

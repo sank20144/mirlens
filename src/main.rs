@@ -23,7 +23,20 @@ use rustc_middle::ty::TyCtxt;
 fn analyze<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, body: &mir::Body<'tcx>) {
     println!("\nfn {}", tcx.def_path_str(def_id));
     for (bb, data) in body.basic_blocks.iter_enumerated() {
-        println!("  {bb:?}: {} statements", data.statements.len());
+        println!("  {bb:?}:");
+        for stmt in &data.statements {
+            walk_statement(stmt);
+        }
+    }
+}
+
+fn walk_statement(stmt: &mir::Statement<'_>) {
+    use mir::StatementKind::*;
+    match &stmt.kind {
+        Assign(b) => println!("    {:?} = {:?}", b.0, b.1),
+        StorageLive(l) => println!("    StorageLive({l:?})"),
+        StorageDead(l) => println!("    StorageDead({l:?})"),
+        other => println!("    {other:?}"),
     }
 }
 

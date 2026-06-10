@@ -7,6 +7,10 @@ use rustc_middle::ty::TyCtxt;
 
 pub fn body<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, body: &mir::Body<'tcx>) {
     println!("\nfn {}", tcx.def_path_str(def_id));
+    for (local, decl) in body.local_decls.iter_enumerated() {
+        let kw = if matches!(decl.mutability, mir::Mutability::Mut) { "mut " } else { "" };
+        println!("  let {kw}{local:?}: {}", decl.ty);
+    }
     for (bb, data) in body.basic_blocks.iter_enumerated() {
         println!("  {bb:?}:");
         for stmt in &data.statements {

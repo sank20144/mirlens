@@ -19,65 +19,11 @@ use rustc_interface::interface;
 use rustc_middle::mir;
 use rustc_middle::ty::TyCtxt;
 
+mod walk;
+
 /// Called once per function, with its MIR.
 fn analyze<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, body: &mir::Body<'tcx>) {
-    println!("\nfn {}", tcx.def_path_str(def_id));
-    for (bb, data) in body.basic_blocks.iter_enumerated() {
-        println!("  {bb:?}:");
-        for stmt in &data.statements {
-            walk_statement(stmt);
-        }
-        walk_terminator(data.terminator());
-    }
-}
-
-fn walk_terminator(term: &mir::Terminator<'_>) {
-    use mir::TerminatorKind::*;
-    match &term.kind {
-        Goto { target } => println!("    goto -> {target:?}"),
-        SwitchInt { discr, .. } => println!("    switchInt({discr:?})"),
-        Call { func, .. } => println!("    call {func:?}"),
-        Drop { place, .. } => println!("    drop({place:?})"),
-        Return => println!("    return"),
-        other => println!("    {other:?}"),
-    }
-}
-
-fn walk_rvalue(rv: &mir::Rvalue<'_>) {
-    use mir::Rvalue::*;
-    match rv {
-        Use(op, _) => walk_operand(op),
-        Ref(_, _, place) => println!("      &{place:?}"),
-        BinaryOp(op, b) => {
-            println!("      {op:?}");
-            walk_operand(&b.0);
-            walk_operand(&b.1);
-        }
-        other => println!("      {other:?}"),
-    }
-}
-
-fn walk_operand(op: &mir::Operand<'_>) {
-    match op {
-        mir::Operand::Copy(p) => println!("      copy {p:?}"),
-        mir::Operand::Move(p) => println!("      move {p:?}"),
-        mir::Operand::Constant(c) => println!("      const {:?}", c.const_),
-        _ => {}
-    }
-}
-
-fn walk_statement(stmt: &mir::Statement<'_>) {
-    use mir::StatementKind::*;
-    match &stmt.kind {
-        Assign(b) => {
-            let (place, rv) = &**b;
-            println!("    {place:?} =");
-            walk_rvalue(rv);
-        }
-        StorageLive(l) => println!("    StorageLive({l:?})"),
-        StorageDead(l) => println!("    StorageDead({l:?})"),
-        other => println!("    {other:?}"),
-    }
+    walk::body(tcx, def_id, body);
 }
 
 struct Driver;

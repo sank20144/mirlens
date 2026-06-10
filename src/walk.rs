@@ -7,14 +7,14 @@ use rustc_middle::ty::TyCtxt;
 
 /// Hook into the walk. Every method does nothing by default, so an analysis
 /// only overrides the pieces it cares about.
-pub trait Visitor {
+pub trait Visitor<'tcx> {
     fn block(&mut self, _bb: mir::BasicBlock) {}
-    fn statement(&mut self, _stmt: &mir::Statement<'_>) {}
-    fn terminator(&mut self, _term: &mir::Terminator<'_>) {}
+    fn statement(&mut self, _stmt: &mir::Statement<'tcx>) {}
+    fn terminator(&mut self, _term: &mir::Terminator<'tcx>) {}
 }
 
 /// Walk every block of `body`, handing each piece to `v`.
-pub fn walk<'tcx>(body: &mir::Body<'tcx>, v: &mut dyn Visitor) {
+pub fn walk<'tcx>(body: &mir::Body<'tcx>, v: &mut impl Visitor<'tcx>) {
     for (bb, data) in body.basic_blocks.iter_enumerated() {
         v.block(bb);
         for stmt in &data.statements {
@@ -36,12 +36,12 @@ pub fn body<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, body: &mir::Body<'tcx>) {
 
 struct Printer;
 
-impl Visitor for Printer {
+impl<'tcx> Visitor<'tcx> for Printer {
     fn block(&mut self, bb: mir::BasicBlock) {
         println!("  {bb:?}:");
     }
 
-    fn statement(&mut self, stmt: &mir::Statement<'_>) {
+    fn statement(&mut self, stmt: &mir::Statement<'tcx>) {
         use mir::StatementKind::*;
         match &stmt.kind {
             Assign(b) => {
@@ -55,7 +55,7 @@ impl Visitor for Printer {
         }
     }
 
-    fn terminator(&mut self, term: &mir::Terminator<'_>) {
+    fn terminator(&mut self, term: &mir::Terminator<'tcx>) {
         use mir::TerminatorKind::*;
         match &term.kind {
             Goto { target } => println!("    goto -> {target:?}"),

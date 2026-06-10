@@ -25,7 +25,7 @@ mod walk;
 /// Called once per function, with its MIR.
 fn analyze<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, body: &mir::Body<'tcx>) {
     walk::body(tcx, def_id, body);
-    summary::run(body);
+    summary::run(tcx, body);
 }
 
 struct Driver;

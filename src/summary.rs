@@ -10,6 +10,7 @@ use crate::walk::{self, Visitor};
 enum Sym {
     Input(String),
     Const(i128),
+    Bin(String, Box<Sym>, Box<Sym>),
     Unknown,
 }
 
@@ -18,6 +19,7 @@ impl std::fmt::Display for Sym {
         match self {
             Sym::Input(name) => write!(f, "{name}"),
             Sym::Const(v) => write!(f, "{v}"),
+            Sym::Bin(op, l, r) => write!(f, "({l} {op} {r})"),
             Sym::Unknown => write!(f, "?"),
         }
     }
@@ -44,6 +46,10 @@ impl<'tcx> Summary<'tcx> {
     fn rvalue(&self, rv: &mir::Rvalue<'tcx>) -> Sym {
         match rv {
             mir::Rvalue::Use(op, _) => self.operand(op),
+            mir::Rvalue::BinaryOp(op, b) => {
+                let (l, r) = &**b;
+                Sym::Bin(bin_op(op), Box::new(self.operand(l)), Box::new(self.operand(r)))
+            }
             _ => Sym::Unknown,
         }
     }
@@ -59,6 +65,15 @@ impl<'tcx> Summary<'tcx> {
             },
             _ => Sym::Unknown,
         }
+    }
+}
+
+fn bin_op(op: &mir::BinOp) -> String {
+    match op {
+        mir::BinOp::Add => "+".into(),
+        mir::BinOp::Sub => "-".into(),
+        mir::BinOp::Mul => "*".into(),
+        other => format!("{other:?}"),
     }
 }
 

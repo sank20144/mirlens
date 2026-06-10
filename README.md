@@ -1,12 +1,21 @@
 # mirlens
 
-A minimal custom `rustc` driver. It compiles a Rust file, pulls the MIR of every
-function, and hands each one to `analyze` in `src/main.rs`. `analyze` currently
-just prints the MIR — it's the single hook for building an analysis on top.
+A custom `rustc` driver that reads the MIR of every function in a crate and runs
+a small analysis over it.
+
+For each function it:
+
+- **walks the MIR** — basic blocks, their statements and terminator, down into
+  the rvalues and operands (`src/walk.rs`), and
+- **prints a rough symbolic summary** — gives each parameter a symbolic value and
+  reports what the function returns in terms of those inputs, folding in
+  constants and building arithmetic expressions (`src/summary.rs`).
+
+So `fn f(x: i32) -> i32 { x * 2 + 1 }` reports `returns ((_1 * 2) + 1)`.
 
 The driver runs the compiler as a library (`rustc_private`) and stops right after
-analysis, so it never produces a binary. It compiles with MIR optimizations off
-and UB checks preserved, which keeps the MIR faithful to what the source says.
+analysis, so it never produces a binary. It keeps the MIR unoptimized with UB
+checks preserved, so the MIR stays faithful to what the source says.
 
 ## Build
 
@@ -21,9 +30,11 @@ Pass a Rust file plus the usual rustc flags:
 
     target/debug/mirlens --edition 2021 --crate-type lib path/to/file.rs
 
-The driver prints the MIR of each function in the file.
+## How it's put together
 
-## Extending
+- `src/main.rs` — the driver: hooks rustc and hands each function's MIR to `analyze`.
+- `src/walk.rs` — a `Visitor` trait and a `walk` that drives it over a body; the
+  default `Printer` is what prints the MIR.
+- `src/summary.rs` — a `Visitor` that builds a symbolic value per local.
 
-`analyze(tcx, def_id, body)` gets one function's MIR at a time. Everything else
-is just driver plumbing.
+Implement `Visitor` and call `walk` to plug in your own analysis.

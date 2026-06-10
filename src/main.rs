@@ -19,11 +19,13 @@ use rustc_interface::interface;
 use rustc_middle::mir;
 use rustc_middle::ty::TyCtxt;
 
+mod summary;
 mod walk;
 
 /// Called once per function, with its MIR.
 fn analyze<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, body: &mir::Body<'tcx>) {
     walk::body(tcx, def_id, body);
+    summary::run(body);
 }
 
 struct Driver;

@@ -12,6 +12,8 @@ enum Sym {
     Const(i128),
     Bin(String, Box<Sym>, Box<Sym>),
     Un(String, Box<Sym>),
+    /// A reference to a local: `target` is which local, `name` is just for display.
+    Ref { target: usize, name: String },
     Unknown,
 }
 
@@ -22,14 +24,21 @@ impl std::fmt::Display for Sym {
             Sym::Const(v) => write!(f, "{v}"),
             Sym::Bin(op, l, r) => write!(f, "({l} {op} {r})"),
             Sym::Un(op, v) => write!(f, "{op}{v}"),
+            Sym::Ref { name, .. } => write!(f, "&{name}"),
             Sym::Unknown => write!(f, "?"),
         }
     }
 }
 
+/// Is this place a single `*p` (one Deref, nothing else)?
+fn single_deref(p: &mir::Place<'_>) -> bool {
+    p.projection.len() == 1 && matches!(p.projection[0], mir::ProjectionElem::Deref)
+}
+
 struct Summary<'tcx> {
     tcx: TyCtxt<'tcx>,
     typing_env: ty::TypingEnv<'tcx>,
+    names: Vec<String>,
     env: Vec<Sym>,
 }
 
@@ -54,20 +63,42 @@ impl<'tcx> Summary<'tcx> {
             }
             mir::Rvalue::UnaryOp(op, operand) => Sym::Un(un_op(op), Box::new(self.operand(operand))),
             mir::Rvalue::Cast(_, operand, _) => self.operand(operand),
+            mir::Rvalue::Ref(_, _, place) | mir::Rvalue::RawPtr(_, place) => self.make_ref(place),
             _ => Sym::Unknown,
+        }
+    }
+
+    fn make_ref(&self, place: &mir::Place<'tcx>) -> Sym {
+        if place.projection.is_empty() {
+            let target = place.local.as_usize();
+            Sym::Ref { target, name: self.names[target].clone() }
+        } else {
+            Sym::Unknown
         }
     }
 
     fn operand(&self, op: &mir::Operand<'tcx>) -> Sym {
         match op {
-            mir::Operand::Copy(p) | mir::Operand::Move(p) if p.projection.is_empty() => {
-                self.env[p.local.as_usize()].clone()
-            }
+            mir::Operand::Copy(p) | mir::Operand::Move(p) => self.place_value(p),
             mir::Operand::Constant(c) => match c.const_.try_eval_bits(self.tcx, self.typing_env) {
                 Some(bits) => Sym::Const(bits as i128),
                 None => Sym::Unknown,
             },
             _ => Sym::Unknown,
+        }
+    }
+
+    /// The symbolic value read from a place: a bare local, or `*p` when `p` is a known reference.
+    fn place_value(&self, p: &mir::Place<'tcx>) -> Sym {
+        if p.projection.is_empty() {
+            self.env[p.local.as_usize()].clone()
+        } else if single_deref(p) {
+            match &self.env[p.local.as_usize()] {
+                Sym::Ref { target, .. } => self.env[*target].clone(),
+                _ => Sym::Unknown,
+            }
+        } else {
+            Sym::Unknown
         }
     }
 }
@@ -108,7 +139,7 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, body: &mir::Body<'tcx>) {
     for i in 1..=body.arg_count {
         env[i] = Sym::Input(names[i].clone());
     }
-    let mut s = Summary { tcx, typing_env: ty::TypingEnv::fully_monomorphized(), env };
+    let mut s = Summary { tcx, typing_env: ty::TypingEnv::fully_monomorphized(), names, env };
     walk::walk(body, &mut s);
     println!("  summary: returns {}", s.env[0]);
 }

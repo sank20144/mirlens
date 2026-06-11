@@ -18,6 +18,8 @@ enum Sym {
     Call(String, Vec<Sym>),
     /// A field read off another value: `base.name`.
     Field(Box<Sym>, String),
+    /// A composite built in place — struct/tuple/array fields in declaration order.
+    Aggregate(Vec<Sym>),
     Unknown,
 }
 
@@ -34,6 +36,10 @@ impl std::fmt::Display for Sym {
                 write!(f, "{name}({})", args.join(", "))
             }
             Sym::Field(base, name) => write!(f, "{base}.{name}"),
+            Sym::Aggregate(elems) => {
+                let parts: Vec<String> = elems.iter().map(|e| e.to_string()).collect();
+                write!(f, "({})", parts.join(", "))
+            }
             Sym::Unknown => write!(f, "?"),
         }
     }
@@ -101,6 +107,9 @@ impl<'tcx> Summary<'tcx> {
             mir::Rvalue::UnaryOp(op, operand) => mk_un(op, self.operand(operand)),
             mir::Rvalue::Cast(_, operand, _) => self.operand(operand),
             mir::Rvalue::Ref(_, _, place) | mir::Rvalue::RawPtr(_, place) => self.make_ref(place),
+            mir::Rvalue::Aggregate(_, operands) => {
+                Sym::Aggregate(operands.iter().map(|o| self.operand(o)).collect())
+            }
             _ => Sym::Unknown,
         }
     }
@@ -149,9 +158,12 @@ impl<'tcx> Summary<'tcx> {
                 _ => Sym::Unknown,
             }
         } else if let [mir::ProjectionElem::Field(idx, _)] = &p.projection[..] {
+            let i = idx.as_usize();
             match self.env[local].clone() {
+                // Reading a field off a composite we built: hand back that field's value.
+                Sym::Aggregate(elems) => elems.into_iter().nth(i).unwrap_or(Sym::Unknown),
                 Sym::Unknown => Sym::Unknown,
-                base => Sym::Field(Box::new(base), self.field_name(self.tys[local], idx.as_usize())),
+                base => Sym::Field(Box::new(base), self.field_name(self.tys[local], i)),
             }
         } else {
             Sym::Unknown

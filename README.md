@@ -32,6 +32,24 @@ Pass a Rust file plus the usual rustc flags:
 
     target/debug/mirlens --edition 2021 --crate-type lib path/to/file.rs
 
+For a file containing `pub fn f(x: i32) -> i32 { x * 2 + 1 }` it prints the walk
+followed by the summary line:
+
+    fn f
+      let mut _0: i32
+      let _1: i32
+      ...
+      bb0:
+        _2 =
+          Mul
+          move _3
+          const Val(Scalar(0x00000002), i32)
+        ...
+        return
+      summary: returns ((x * 2) + 1)
+
+The `summary:` line at the end is what each function reduces to.
+
 ## How it's put together
 
 - `src/main.rs` — the driver: hooks rustc and hands each function's MIR to `analyze`.

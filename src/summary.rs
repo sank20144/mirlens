@@ -11,6 +11,7 @@ enum Sym {
     Input(String),
     Const(i128),
     Bin(String, Box<Sym>, Box<Sym>),
+    Un(String, Box<Sym>),
     Unknown,
 }
 
@@ -20,6 +21,7 @@ impl std::fmt::Display for Sym {
             Sym::Input(name) => write!(f, "{name}"),
             Sym::Const(v) => write!(f, "{v}"),
             Sym::Bin(op, l, r) => write!(f, "({l} {op} {r})"),
+            Sym::Un(op, v) => write!(f, "{op}{v}"),
             Sym::Unknown => write!(f, "?"),
         }
     }
@@ -50,6 +52,8 @@ impl<'tcx> Summary<'tcx> {
                 let (l, r) = &**b;
                 Sym::Bin(bin_op(op), Box::new(self.operand(l)), Box::new(self.operand(r)))
             }
+            mir::Rvalue::UnaryOp(op, operand) => Sym::Un(un_op(op), Box::new(self.operand(operand))),
+            mir::Rvalue::Cast(_, operand, _) => self.operand(operand),
             _ => Sym::Unknown,
         }
     }
@@ -73,6 +77,14 @@ fn bin_op(op: &mir::BinOp) -> String {
         mir::BinOp::Add => "+".into(),
         mir::BinOp::Sub => "-".into(),
         mir::BinOp::Mul => "*".into(),
+        other => format!("{other:?}"),
+    }
+}
+
+fn un_op(op: &mir::UnOp) -> String {
+    match op {
+        mir::UnOp::Neg => "-".into(),
+        mir::UnOp::Not => "!".into(),
         other => format!("{other:?}"),
     }
 }

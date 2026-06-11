@@ -51,6 +51,13 @@ followed by the summary line:
 
 The `summary:` line at the end is what each function reduces to.
 
+## Limitations
+
+The walk runs straight through the basic blocks in index order — there's no
+control-flow merge or fixpoint. For a function that branches (`if`, `match`) the
+summary is just whatever the last block happened to assign, so it's tagged
+`(approximate: branches not modelled)`. Loops aren't handled either.
+
 ## Samples
 
 `samples/` holds small programs to try, each with a header comment noting its

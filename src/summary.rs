@@ -275,5 +275,20 @@ pub fn run<'tcx>(tcx: TyCtxt<'tcx>, body: &mir::Body<'tcx>) {
     }
     let mut s = Summary { tcx, typing_env: ty::TypingEnv::fully_monomorphized(), names, tys, env };
     walk::walk(body, &mut s);
-    println!("  summary: returns {}", s.env[0]);
+
+    // The walk runs straight through the blocks in index order with no control-flow
+    // merge, so for a function that branches the result is whatever the last block
+    // happened to assign. Say so rather than pretend it's exact.
+    if has_branch(body) {
+        println!("  summary: returns {}  (approximate: branches not modelled)", s.env[0]);
+    } else {
+        println!("  summary: returns {}", s.env[0]);
+    }
+}
+
+/// Does the body branch? (an `if`/`match` lowers to a `SwitchInt`.)
+fn has_branch(body: &mir::Body<'_>) -> bool {
+    body.basic_blocks
+        .iter()
+        .any(|bb| matches!(bb.terminator().kind, mir::TerminatorKind::SwitchInt { .. }))
 }

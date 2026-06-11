@@ -14,6 +14,8 @@ enum Sym {
     Un(String, Box<Sym>),
     /// A reference to a local: `target` is which local, `name` is just for display.
     Ref { target: usize, name: String },
+    /// The result of calling `name` with the given argument values.
+    Call(String, Vec<Sym>),
     Unknown,
 }
 
@@ -25,6 +27,10 @@ impl std::fmt::Display for Sym {
             Sym::Bin(op, l, r) => write!(f, "({l} {op} {r})"),
             Sym::Un(op, v) => write!(f, "{op}{v}"),
             Sym::Ref { name, .. } => write!(f, "&{name}"),
+            Sym::Call(name, args) => {
+                let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+                write!(f, "{name}({})", args.join(", "))
+            }
             Sym::Unknown => write!(f, "?"),
         }
     }
@@ -62,6 +68,22 @@ impl<'tcx> Visitor<'tcx> for Summary<'tcx> {
             }
         }
     }
+
+    fn terminator(&mut self, term: &mir::Terminator<'tcx>) {
+        if let mir::TerminatorKind::Call { func, args, destination, .. } = &term.kind {
+            // The return value lands in `destination` once the call returns.
+            if destination.projection.is_empty() {
+                let dest = destination.local.as_usize();
+                self.env[dest] = match self.callee_name(func) {
+                    Some(name) => {
+                        let args = args.iter().map(|a| self.operand(&a.node)).collect();
+                        Sym::Call(name, args)
+                    }
+                    None => Sym::Unknown,
+                };
+            }
+        }
+    }
 }
 
 impl<'tcx> Summary<'tcx> {
@@ -76,6 +98,18 @@ impl<'tcx> Summary<'tcx> {
             mir::Rvalue::Cast(_, operand, _) => self.operand(operand),
             mir::Rvalue::Ref(_, _, place) | mir::Rvalue::RawPtr(_, place) => self.make_ref(place),
             _ => Sym::Unknown,
+        }
+    }
+
+    /// The short name of a directly-called function, if `func` is a `FnDef` constant.
+    fn callee_name(&self, func: &mir::Operand<'tcx>) -> Option<String> {
+        let c = match func {
+            mir::Operand::Constant(c) => c,
+            _ => return None, // indirect call through a fn pointer: name unknown
+        };
+        match c.const_.ty().kind() {
+            ty::FnDef(def_id, _) => Some(self.tcx.item_name(*def_id).to_string()),
+            _ => None,
         }
     }
 

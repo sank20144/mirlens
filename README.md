@@ -11,8 +11,8 @@ For each function it:
   (named from debug info) and reports what the function returns in terms of those
   inputs: it folds in constants, builds arithmetic, comparison, bitwise and unary
   expressions, follows simple references — `&x`, and reads/writes through `*p` — builds
-  struct and tuple values and reads their fields back as `s.field`, and records calls as
-  `f(arg, ...)` (`src/summary.rs`).
+  struct and tuple values and reads their fields back as `s.field`, indexes arrays at a
+  known position (`a[0]`), and records calls as `f(arg, ...)` (`src/summary.rs`).
 
 So `fn f(x: i32) -> i32 { x * 2 + 1 }` reports `returns ((x * 2) + 1)`, and
 `fn h() { let mut x = 1; let r = &mut x; *r = 7; x }` reports `returns 7`.

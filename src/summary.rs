@@ -20,6 +20,8 @@ enum Sym {
     Field(Box<Sym>, String),
     /// A composite built in place — struct/tuple/array fields in declaration order.
     Aggregate(Vec<Sym>),
+    /// An indexed read: `base[idx]`.
+    Index(Box<Sym>, Box<Sym>),
     Unknown,
 }
 
@@ -40,6 +42,7 @@ impl std::fmt::Display for Sym {
                 let parts: Vec<String> = elems.iter().map(|e| e.to_string()).collect();
                 write!(f, "({})", parts.join(", "))
             }
+            Sym::Index(base, idx) => write!(f, "{base}[{idx}]"),
             Sym::Unknown => write!(f, "?"),
         }
     }
@@ -165,6 +168,13 @@ impl<'tcx> Summary<'tcx> {
                 Sym::Unknown => Sym::Unknown,
                 base => Sym::Field(Box::new(base), self.field_name(self.tys[local], i)),
             }
+        } else if let [mir::ProjectionElem::Index(li)] = &p.projection[..] {
+            // `a[i]`: the index lives in its own local, often a known constant.
+            index_into(self.env[local].clone(), self.env[li.as_usize()].clone())
+        } else if let [mir::ProjectionElem::ConstantIndex { offset, from_end: false, .. }] =
+            &p.projection[..]
+        {
+            index_into(self.env[local].clone(), Sym::Const(*offset as i128))
         } else {
             Sym::Unknown
         }
@@ -181,6 +191,22 @@ impl<'tcx> Summary<'tcx> {
             }
         }
         idx.to_string()
+    }
+}
+
+/// Index into a value. A known aggregate at a known in-range constant resolves to that
+/// element; otherwise it stays the symbolic read `base[idx]`.
+fn index_into(base: Sym, idx: Sym) -> Sym {
+    if let (Sym::Aggregate(elems), Sym::Const(i)) = (&base, &idx) {
+        if let Ok(i) = usize::try_from(*i) {
+            if let Some(e) = elems.get(i) {
+                return e.clone();
+            }
+        }
+    }
+    match base {
+        Sym::Unknown => Sym::Unknown,
+        base => Sym::Index(Box::new(base), Box::new(idx)),
     }
 }
 

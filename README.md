@@ -50,6 +50,15 @@ followed by the summary line:
 
 The `summary:` line at the end is what each function reduces to.
 
+## Samples
+
+`samples/` holds small programs to try, each with a header comment noting its
+expected summary. Run one, or all of them:
+
+    target/debug/mirlens --edition 2021 --crate-type lib samples/arithmetic.rs
+
+    for s in samples/*.rs; do target/debug/mirlens --edition 2021 --crate-type lib "$s"; done
+
 ## How it's put together
 
 - `src/main.rs` — the driver: hooks rustc and hands each function's MIR to `analyze`.

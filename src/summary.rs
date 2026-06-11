@@ -16,6 +16,8 @@ enum Sym {
     Ref { target: usize, name: String },
     /// The result of calling `name` with the given argument values.
     Call(String, Vec<Sym>),
+    /// A field read off another value: `base.name`.
+    Field(Box<Sym>, String),
     Unknown,
 }
 
@@ -31,6 +33,7 @@ impl std::fmt::Display for Sym {
                 let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
                 write!(f, "{name}({})", args.join(", "))
             }
+            Sym::Field(base, name) => write!(f, "{base}.{name}"),
             Sym::Unknown => write!(f, "?"),
         }
     }
@@ -45,6 +48,7 @@ struct Summary<'tcx> {
     tcx: TyCtxt<'tcx>,
     typing_env: ty::TypingEnv<'tcx>,
     names: Vec<String>,
+    tys: Vec<ty::Ty<'tcx>>,
     env: Vec<Sym>,
 }
 
@@ -133,18 +137,38 @@ impl<'tcx> Summary<'tcx> {
         }
     }
 
-    /// The symbolic value read from a place: a bare local, or `*p` when `p` is a known reference.
+    /// The symbolic value read from a place: a bare local, `*p` when `p` is a known
+    /// reference, or `base.field` for a single field access.
     fn place_value(&self, p: &mir::Place<'tcx>) -> Sym {
+        let local = p.local.as_usize();
         if p.projection.is_empty() {
-            self.env[p.local.as_usize()].clone()
+            self.env[local].clone()
         } else if single_deref(p) {
-            match &self.env[p.local.as_usize()] {
+            match &self.env[local] {
                 Sym::Ref { target, .. } => self.env[*target].clone(),
                 _ => Sym::Unknown,
+            }
+        } else if let [mir::ProjectionElem::Field(idx, _)] = &p.projection[..] {
+            match self.env[local].clone() {
+                Sym::Unknown => Sym::Unknown,
+                base => Sym::Field(Box::new(base), self.field_name(self.tys[local], idx.as_usize())),
             }
         } else {
             Sym::Unknown
         }
+    }
+
+    /// The source name of field `idx` of `base_ty`, falling back to its position for
+    /// tuples or anything that isn't a struct.
+    fn field_name(&self, base_ty: ty::Ty<'tcx>, idx: usize) -> String {
+        if let ty::Adt(def, _) = base_ty.kind() {
+            if def.is_struct() {
+                if let Some(fd) = def.non_enum_variant().fields.iter().nth(idx) {
+                    return fd.name.to_string();
+                }
+            }
+        }
+        idx.to_string()
     }
 }
 
@@ -244,11 +268,12 @@ fn local_names(body: &mir::Body<'_>) -> Vec<String> {
 
 pub fn run<'tcx>(tcx: TyCtxt<'tcx>, body: &mir::Body<'tcx>) {
     let names = local_names(body);
+    let tys = body.local_decls.iter().map(|d| d.ty).collect();
     let mut env = vec![Sym::Unknown; body.local_decls.len()];
     for i in 1..=body.arg_count {
         env[i] = Sym::Input(names[i].clone());
     }
-    let mut s = Summary { tcx, typing_env: ty::TypingEnv::fully_monomorphized(), names, env };
+    let mut s = Summary { tcx, typing_env: ty::TypingEnv::fully_monomorphized(), names, tys, env };
     walk::walk(body, &mut s);
     println!("  summary: returns {}", s.env[0]);
 }

@@ -77,10 +77,24 @@ fn bin_op(op: &mir::BinOp) -> String {
     }
 }
 
+/// Source name of each local from MIR debug info, falling back to `_N`.
+fn local_names(body: &mir::Body<'_>) -> Vec<String> {
+    let mut names: Vec<String> = (0..body.local_decls.len()).map(|i| format!("_{i}")).collect();
+    for info in &body.var_debug_info {
+        if let mir::VarDebugInfoContents::Place(p) = &info.value {
+            if p.projection.is_empty() {
+                names[p.local.as_usize()] = info.name.as_str().to_string();
+            }
+        }
+    }
+    names
+}
+
 pub fn run<'tcx>(tcx: TyCtxt<'tcx>, body: &mir::Body<'tcx>) {
+    let names = local_names(body);
     let mut env = vec![Sym::Unknown; body.local_decls.len()];
     for i in 1..=body.arg_count {
-        env[i] = Sym::Input(format!("_{i}"));
+        env[i] = Sym::Input(names[i].clone());
     }
     let mut s = Summary { tcx, typing_env: ty::TypingEnv::fully_monomorphized(), env };
     walk::walk(body, &mut s);

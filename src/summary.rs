@@ -115,12 +115,29 @@ impl<'tcx> Summary<'tcx> {
 }
 
 fn bin_op(op: &mir::BinOp) -> String {
+    use mir::BinOp::*;
+    // Unchecked/WithOverflow variants are the same operation as their plain form at
+    // the source level, so they share a symbol.
     match op {
-        mir::BinOp::Add => "+".into(),
-        mir::BinOp::Sub => "-".into(),
-        mir::BinOp::Mul => "*".into(),
-        other => format!("{other:?}"),
+        Add | AddUnchecked | AddWithOverflow => "+",
+        Sub | SubUnchecked | SubWithOverflow => "-",
+        Mul | MulUnchecked | MulWithOverflow => "*",
+        Div => "/",
+        Rem => "%",
+        BitXor => "^",
+        BitAnd => "&",
+        BitOr => "|",
+        Shl | ShlUnchecked => "<<",
+        Shr | ShrUnchecked => ">>",
+        Eq => "==",
+        Ne => "!=",
+        Lt => "<",
+        Le => "<=",
+        Gt => ">",
+        Ge => ">=",
+        other => return format!("{other:?}"),
     }
+    .into()
 }
 
 fn un_op(op: &mir::UnOp) -> String {

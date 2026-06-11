@@ -9,8 +9,9 @@ For each function it:
   the rvalues and operands (`src/walk.rs`), and
 - **prints a rough symbolic summary** — gives each parameter a symbolic value
   (named from debug info) and reports what the function returns in terms of those
-  inputs: it folds in constants, builds arithmetic and unary expressions, and
-  follows simple references — `&x`, and reads/writes through `*p` (`src/summary.rs`).
+  inputs: it folds in constants, builds arithmetic, comparison, bitwise and unary
+  expressions, and follows simple references — `&x`, and reads/writes through `*p`
+  (`src/summary.rs`).
 
 So `fn f(x: i32) -> i32 { x * 2 + 1 }` reports `returns ((x * 2) + 1)`, and
 `fn h() { let mut x = 1; let r = &mut x; *r = 7; x }` reports `returns 7`.

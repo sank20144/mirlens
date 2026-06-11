@@ -46,8 +46,19 @@ impl<'tcx> Visitor<'tcx> for Summary<'tcx> {
     fn statement(&mut self, stmt: &mir::Statement<'tcx>) {
         if let mir::StatementKind::Assign(b) = &stmt.kind {
             let (place, rv) = &**b;
+            let v = self.rvalue(rv);
+            let dest = place.local.as_usize();
             if place.projection.is_empty() {
-                self.env[place.local.as_usize()] = self.rvalue(rv);
+                self.env[dest] = v;
+            } else if single_deref(place) {
+                // `*p = v`: if p is a known reference, update what it points at.
+                let target = match &self.env[dest] {
+                    Sym::Ref { target, .. } => Some(*target),
+                    _ => None,
+                };
+                if let Some(t) = target {
+                    self.env[t] = v;
+                }
             }
         }
     }

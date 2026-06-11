@@ -70,9 +70,9 @@ impl<'tcx> Summary<'tcx> {
             mir::Rvalue::Use(op, _) => self.operand(op),
             mir::Rvalue::BinaryOp(op, b) => {
                 let (l, r) = &**b;
-                Sym::Bin(bin_op(op), Box::new(self.operand(l)), Box::new(self.operand(r)))
+                mk_bin(op, self.operand(l), self.operand(r))
             }
-            mir::Rvalue::UnaryOp(op, operand) => Sym::Un(un_op(op), Box::new(self.operand(operand))),
+            mir::Rvalue::UnaryOp(op, operand) => mk_un(op, self.operand(operand)),
             mir::Rvalue::Cast(_, operand, _) => self.operand(operand),
             mir::Rvalue::Ref(_, _, place) | mir::Rvalue::RawPtr(_, place) => self.make_ref(place),
             _ => Sym::Unknown,
@@ -111,6 +111,53 @@ impl<'tcx> Summary<'tcx> {
         } else {
             Sym::Unknown
         }
+    }
+}
+
+/// Build a binary expression, folding it to a constant when both sides are known.
+fn mk_bin(op: &mir::BinOp, l: Sym, r: Sym) -> Sym {
+    if let (Sym::Const(a), Sym::Const(b)) = (&l, &r) {
+        if let Some(v) = fold_bin(op, *a, *b) {
+            return Sym::Const(v);
+        }
+    }
+    Sym::Bin(bin_op(op), Box::new(l), Box::new(r))
+}
+
+/// Build a unary expression, folding negation of a known constant.
+fn mk_un(op: &mir::UnOp, v: Sym) -> Sym {
+    if let (mir::UnOp::Neg, Sym::Const(a)) = (op, &v) {
+        if let Some(n) = a.checked_neg() {
+            return Sym::Const(n);
+        }
+    }
+    Sym::Un(un_op(op), Box::new(v))
+}
+
+/// Evaluate `a op b` over i128, or `None` when the result isn't well-defined here
+/// (overflow, divide-by-zero, an out-of-range shift, or an op we don't fold).
+/// Comparisons fold to 1/0. Widths aren't tracked, so wrapping isn't modelled.
+fn fold_bin(op: &mir::BinOp, a: i128, b: i128) -> Option<i128> {
+    use mir::BinOp::*;
+    let shift = |amt: i128| (0..128).contains(&amt).then_some(amt as u32);
+    match op {
+        Add | AddUnchecked | AddWithOverflow => a.checked_add(b),
+        Sub | SubUnchecked | SubWithOverflow => a.checked_sub(b),
+        Mul | MulUnchecked | MulWithOverflow => a.checked_mul(b),
+        Div => a.checked_div(b),
+        Rem => a.checked_rem(b),
+        BitXor => Some(a ^ b),
+        BitAnd => Some(a & b),
+        BitOr => Some(a | b),
+        Shl | ShlUnchecked => shift(b).and_then(|s| a.checked_shl(s)),
+        Shr | ShrUnchecked => shift(b).and_then(|s| a.checked_shr(s)),
+        Eq => Some((a == b) as i128),
+        Ne => Some((a != b) as i128),
+        Lt => Some((a < b) as i128),
+        Le => Some((a <= b) as i128),
+        Gt => Some((a > b) as i128),
+        Ge => Some((a >= b) as i128),
+        _ => None,
     }
 }
 

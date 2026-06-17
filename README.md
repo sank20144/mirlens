@@ -54,10 +54,12 @@ The `summary:` line at the end is what each function reduces to.
 
 ## Limitations
 
-The walk runs straight through the basic blocks in index order — there's no
-control-flow merge or fixpoint. For a function that branches (`if`, `match`) the
-summary is just whatever the last block happened to assign, so it's tagged
-`(approximate: branches not modelled)`. Loops aren't handled either.
+Branches are followed: the blocks are visited so each comes after its predecessors,
+and where two arms of an `if` assign different values they're merged back into a
+conditional, so `if c { 1 } else { 2 }` reports `(if c { 1 } else { 2 })`. A merge it
+can't express as a single branch (say a `match` with several arms) falls back to `?`
+and the summary is tagged `(approximate)`. Loops have no such ordering, so a function
+that loops is walked straight through and tagged `(approximate: loops not modelled)`.
 
 ## Samples
 

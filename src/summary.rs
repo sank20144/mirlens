@@ -6,12 +6,14 @@ use rustc_middle::ty::{self, TyCtxt};
 
 use crate::walk::{self, Visitor};
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 enum Sym {
     Input(String),
     Const(i128),
     Bin(String, Box<Sym>, Box<Sym>),
     Un(String, Box<Sym>),
+    /// A value chosen by a branch: `if cond { then } else { els }`.
+    Cond(Box<Sym>, Box<Sym>, Box<Sym>),
     /// A reference to a local: `target` is which local, `name` is just for display.
     Ref { target: usize, name: String },
     /// The result of calling `name` with the given argument values.
@@ -32,6 +34,7 @@ impl std::fmt::Display for Sym {
             Sym::Const(v) => write!(f, "{v}"),
             Sym::Bin(op, l, r) => write!(f, "({l} {op} {r})"),
             Sym::Un(op, v) => write!(f, "{op}{v}"),
+            Sym::Cond(c, t, e) => write!(f, "(if {c} {{ {t} }} else {{ {e} }})"),
             Sym::Ref { name, .. } => write!(f, "&{name}"),
             Sym::Call(name, args) => {
                 let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
@@ -304,29 +307,183 @@ fn local_names(body: &mir::Body<'_>) -> Vec<String> {
     names
 }
 
+/// Why control reached a block, so a join can rebuild the branch it came from.
+#[derive(Clone)]
+enum Guard {
+    /// taken because the switch discriminant equalled this value
+    Eq(Sym, i128),
+    /// taken because none of the listed values matched
+    Otherwise(Sym),
+}
+
 pub fn run<'tcx>(tcx: TyCtxt<'tcx>, body: &mir::Body<'tcx>) {
     let names = local_names(body);
     let tys = body.local_decls.iter().map(|d| d.ty).collect();
-    let mut env = vec![Sym::Unknown; body.local_decls.len()];
+    let mut init = vec![Sym::Unknown; body.local_decls.len()];
     for i in 1..=body.arg_count {
-        env[i] = Sym::Input(names[i].clone());
+        init[i] = Sym::Input(names[i].clone());
     }
-    let mut s = Summary { tcx, typing_env: ty::TypingEnv::fully_monomorphized(), names, tys, env };
-    walk::walk(body, &mut s);
+    let mut s = Summary { tcx, typing_env: ty::TypingEnv::fully_monomorphized(), names, tys, env: init.clone() };
 
-    // The walk runs straight through the blocks in index order with no control-flow
-    // merge, so for a function that branches the result is whatever the last block
-    // happened to assign. Say so rather than pretend it's exact.
-    if has_branch(body) {
-        println!("  summary: returns {}  (approximate: branches not modelled)", s.env[0]);
-    } else {
-        println!("  summary: returns {}", s.env[0]);
+    // Walk the blocks in an order where each comes after its predecessors, merging
+    // branches back together at joins. A loop has no such order, so fall back to a
+    // straight-line walk and admit it's approximate.
+    match topo_order(body) {
+        Some(order) => match s.eval_cfg(body, &order, init) {
+            (val, false) => println!("  summary: returns {val}"),
+            (val, true) => println!("  summary: returns {val}  (approximate)"),
+        },
+        None => {
+            s.env = init;
+            walk::walk(body, &mut s);
+            println!("  summary: returns {}  (approximate: loops not modelled)", s.env[0]);
+        }
     }
 }
 
-/// Does the body branch? (an `if`/`match` lowers to a `SwitchInt`.)
-fn has_branch(body: &mir::Body<'_>) -> bool {
-    body.basic_blocks
-        .iter()
-        .any(|bb| matches!(bb.terminator().kind, mir::TerminatorKind::SwitchInt { .. }))
+impl<'tcx> Summary<'tcx> {
+    /// Evaluate the body block by block in `order`, computing each block's entry from
+    /// its predecessors' exits and merging differing values into a branch. Returns the
+    /// final value of `_0` and whether any merge had to give up and approximate.
+    fn eval_cfg(&mut self, body: &mir::Body<'tcx>, order: &[mir::BasicBlock], init: Vec<Sym>) -> (Sym, bool) {
+        let preds = body.basic_blocks.predecessors();
+        let n = body.basic_blocks.len();
+        let mut exit: Vec<Option<Vec<Sym>>> = vec![None; n];
+        let mut guard: Vec<Option<Guard>> = vec![None; n];
+        let mut imprecise = false;
+        let mut returns: Vec<Vec<Sym>> = Vec::new();
+
+        for &bb in order {
+            let ps = &preds[bb];
+            let entry = if ps.is_empty() {
+                init.clone()
+            } else if ps.len() == 1 {
+                exit[ps[0].as_usize()].clone().unwrap_or_else(|| init.clone())
+            } else {
+                let (merged, imp) = merge(ps, &exit, &guard);
+                imprecise |= imp;
+                merged
+            };
+
+            self.env = entry;
+            let data = &body.basic_blocks[bb];
+            for stmt in &data.statements {
+                self.statement(stmt);
+            }
+            let term = data.terminator();
+            self.terminator(term);
+            exit[bb.as_usize()] = Some(self.env.clone());
+
+            match &term.kind {
+                mir::TerminatorKind::SwitchInt { discr, targets } => {
+                    let d = self.operand(discr);
+                    for (v, t) in targets.iter() {
+                        guard[t.as_usize()] = Some(Guard::Eq(d.clone(), v as i128));
+                    }
+                    guard[targets.otherwise().as_usize()] = Some(Guard::Otherwise(d));
+                }
+                mir::TerminatorKind::Return => returns.push(self.env.clone()),
+                _ => {
+                    // Carry this block's guard down a straight chain so it survives to
+                    // the next join; a join sets its own guard, so don't overwrite it.
+                    for succ in term.successors() {
+                        if preds[succ].len() == 1 {
+                            guard[succ.as_usize()] = guard[bb.as_usize()].clone();
+                        }
+                    }
+                }
+            }
+        }
+
+        match returns.as_slice() {
+            [only] => (only[0].clone(), imprecise),
+            [first, rest @ ..] if rest.iter().all(|e| e[0] == first[0]) => (first[0].clone(), imprecise),
+            _ => (Sym::Unknown, true),
+        }
+    }
+}
+
+/// Merge the exit states of several predecessors into one entry state. Where they
+/// agree the value carries through; where exactly two disagree and their guards are
+/// the two sides of one branch, rebuild that branch. Anything else gives up.
+fn merge(preds: &[mir::BasicBlock], exit: &[Option<Vec<Sym>>], guard: &[Option<Guard>]) -> (Vec<Sym>, bool) {
+    let avail: Vec<mir::BasicBlock> =
+        preds.iter().copied().filter(|p| exit[p.as_usize()].is_some()).collect();
+    let env = |p: mir::BasicBlock| exit[p.as_usize()].as_ref().unwrap();
+    let mut out = Vec::new();
+    let mut imprecise = false;
+    for i in 0..env(avail[0]).len() {
+        let first = &env(avail[0])[i];
+        if avail.iter().all(|p| env(*p)[i] == *first) {
+            out.push(first.clone());
+        } else if let [a, b] = avail[..] {
+            match branch_value(&env(a)[i], guard[a.as_usize()].as_ref(), &env(b)[i], guard[b.as_usize()].as_ref()) {
+                Some(v) => out.push(v),
+                None => {
+                    out.push(Sym::Unknown);
+                    imprecise = true;
+                }
+            }
+        } else {
+            out.push(Sym::Unknown);
+            imprecise = true;
+        }
+    }
+    (out, imprecise)
+}
+
+/// Rebuild `if cond { .. } else { .. }` from the two arms of a branch, given each
+/// arm's value and the guard that selected it. `None` if the guards aren't a matching
+/// equal/otherwise pair on one discriminant.
+fn branch_value(va: &Sym, ga: Option<&Guard>, vb: &Sym, gb: Option<&Guard>) -> Option<Sym> {
+    // Order the arms so `eq` is the `discr == value` side and `oth` is the fallthrough.
+    let (d, val, eq_val, oth_val) = match (ga?, gb?) {
+        (Guard::Eq(d1, v), Guard::Otherwise(d2)) if d1 == d2 => (d1, *v, va, vb),
+        (Guard::Otherwise(d2), Guard::Eq(d1, v)) if d1 == d2 => (d1, *v, vb, va),
+        _ => return None,
+    };
+    if val == 0 {
+        // A bool: `discr == 0` is the `else`, so the discriminant itself is the test.
+        Some(Sym::Cond(Box::new(d.clone()), Box::new(oth_val.clone()), Box::new(eq_val.clone())))
+    } else {
+        let cond = Sym::Bin("==".into(), Box::new(d.clone()), Box::new(Sym::Const(val)));
+        Some(Sym::Cond(Box::new(cond), Box::new(eq_val.clone()), Box::new(oth_val.clone())))
+    }
+}
+
+/// Order the blocks so every block comes after all its predecessors (reverse
+/// postorder). Returns `None` if there's a back edge, i.e. a loop.
+fn topo_order(body: &mir::Body<'_>) -> Option<Vec<mir::BasicBlock>> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mark {
+        Open,
+        Done,
+    }
+    let succs: Vec<Vec<mir::BasicBlock>> =
+        body.basic_blocks.iter().map(|d| d.terminator().successors().collect()).collect();
+    let mut mark: Vec<Option<Mark>> = vec![None; succs.len()];
+    let mut post = Vec::new();
+    let mut stack = vec![(mir::START_BLOCK, 0usize)];
+    mark[mir::START_BLOCK.as_usize()] = Some(Mark::Open);
+    while let Some(&mut (bb, ref mut i)) = stack.last_mut() {
+        let edges = &succs[bb.as_usize()];
+        if *i < edges.len() {
+            let s = edges[*i];
+            *i += 1;
+            match mark[s.as_usize()] {
+                None => {
+                    mark[s.as_usize()] = Some(Mark::Open);
+                    stack.push((s, 0));
+                }
+                Some(Mark::Open) => return None, // back edge: a loop
+                Some(Mark::Done) => {}
+            }
+        } else {
+            mark[bb.as_usize()] = Some(Mark::Done);
+            post.push(bb);
+            stack.pop();
+        }
+    }
+    post.reverse();
+    Some(post)
 }

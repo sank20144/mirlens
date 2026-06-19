@@ -1,6 +1,6 @@
-//! A first step toward a function summary: give each local a symbolic value and
-//! report what the function returns in terms of its inputs.
+use std::collections::{HashMap, HashSet};
 
+use rustc_hir::def_id::DefId;
 use rustc_middle::mir;
 use rustc_middle::ty::{self, TyCtxt};
 
@@ -12,17 +12,11 @@ enum Sym {
     Const(i128),
     Bin(String, Box<Sym>, Box<Sym>),
     Un(String, Box<Sym>),
-    /// A value chosen by a branch: `if cond { then } else { els }`.
     Cond(Box<Sym>, Box<Sym>, Box<Sym>),
-    /// A reference to a local: `target` is which local, `name` is just for display.
     Ref { target: usize, name: String },
-    /// The result of calling `name` with the given argument values.
     Call(String, Vec<Sym>),
-    /// A field read off another value: `base.name`.
     Field(Box<Sym>, String),
-    /// A composite built in place — struct/tuple/array fields in declaration order.
     Aggregate(Vec<Sym>),
-    /// An indexed read: `base[idx]`.
     Index(Box<Sym>, Box<Sym>),
     Unknown,
 }
@@ -51,20 +45,21 @@ impl std::fmt::Display for Sym {
     }
 }
 
-/// Is this place a single `*p` (one Deref, nothing else)?
 fn single_deref(p: &mir::Place<'_>) -> bool {
     p.projection.len() == 1 && matches!(p.projection[0], mir::ProjectionElem::Deref)
 }
 
-struct Summary<'tcx> {
+struct Summary<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     typing_env: ty::TypingEnv<'tcx>,
     names: Vec<String>,
     tys: Vec<ty::Ty<'tcx>>,
     env: Vec<Sym>,
+    summaries: &'a HashMap<DefId, FnSummary>,
+    approx_call: bool,
 }
 
-impl<'tcx> Visitor<'tcx> for Summary<'tcx> {
+impl<'a, 'tcx> Visitor<'tcx> for Summary<'a, 'tcx> {
     fn statement(&mut self, stmt: &mir::Statement<'tcx>) {
         if let mir::StatementKind::Assign(b) = &stmt.kind {
             let (place, rv) = &**b;
@@ -73,7 +68,6 @@ impl<'tcx> Visitor<'tcx> for Summary<'tcx> {
             if place.projection.is_empty() {
                 self.env[dest] = v;
             } else if single_deref(place) {
-                // `*p = v`: if p is a known reference, update what it points at.
                 let target = match &self.env[dest] {
                     Sym::Ref { target, .. } => Some(*target),
                     _ => None,
@@ -87,22 +81,37 @@ impl<'tcx> Visitor<'tcx> for Summary<'tcx> {
 
     fn terminator(&mut self, term: &mir::Terminator<'tcx>) {
         if let mir::TerminatorKind::Call { func, args, destination, .. } = &term.kind {
-            // The return value lands in `destination` once the call returns.
             if destination.projection.is_empty() {
                 let dest = destination.local.as_usize();
-                self.env[dest] = match self.callee_name(func) {
-                    Some(name) => {
-                        let args = args.iter().map(|a| self.operand(&a.node)).collect();
-                        Sym::Call(name, args)
-                    }
-                    None => Sym::Unknown,
-                };
+                let actuals: Vec<Sym> = args.iter().map(|a| self.operand(&a.node)).collect();
+                self.env[dest] = self.call_value(func, actuals);
             }
         }
     }
 }
 
-impl<'tcx> Summary<'tcx> {
+impl<'a, 'tcx> Summary<'a, 'tcx> {
+    fn call_value(&mut self, func: &mir::Operand<'tcx>, actuals: Vec<Sym>) -> Sym {
+        let Some(callee) = callee_def_id(func).and_then(|d| self.summaries.get(&d)) else {
+            return match self.callee_name(func) {
+                Some(name) => Sym::Call(name, actuals),
+                None => Sym::Unknown,
+            };
+        };
+        let (cparams, cret, cwrites, approx) =
+            (callee.params.clone(), callee.ret.clone(), callee.writes.clone(), callee.note.is_some());
+        if approx {
+            self.approx_call = true;
+        }
+        let binding: HashMap<&str, &Sym> = cparams.iter().map(String::as_str).zip(&actuals).collect();
+        for (param, w) in &cwrites {
+            if let Some(Sym::Ref { target, .. }) = actuals.get(*param) {
+                self.env[*target] = simplify(substitute(w, &binding));
+            }
+        }
+        simplify(substitute(&cret, &binding))
+    }
+
     fn rvalue(&self, rv: &mir::Rvalue<'tcx>) -> Sym {
         match rv {
             mir::Rvalue::Use(op, _) => self.operand(op),
@@ -120,11 +129,10 @@ impl<'tcx> Summary<'tcx> {
         }
     }
 
-    /// The short name of a directly-called function, if `func` is a `FnDef` constant.
     fn callee_name(&self, func: &mir::Operand<'tcx>) -> Option<String> {
         let c = match func {
             mir::Operand::Constant(c) => c,
-            _ => return None, // indirect call through a fn pointer: name unknown
+            _ => return None,
         };
         match c.const_.ty().kind() {
             ty::FnDef(def_id, _) => Some(self.tcx.item_name(*def_id).to_string()),
@@ -136,6 +144,11 @@ impl<'tcx> Summary<'tcx> {
         if place.projection.is_empty() {
             let target = place.local.as_usize();
             Sym::Ref { target, name: self.names[target].clone() }
+        } else if single_deref(place) {
+            match &self.env[place.local.as_usize()] {
+                Sym::Ref { target, name } => Sym::Ref { target: *target, name: name.clone() },
+                _ => Sym::Unknown,
+            }
         } else {
             Sym::Unknown
         }
@@ -152,8 +165,6 @@ impl<'tcx> Summary<'tcx> {
         }
     }
 
-    /// The symbolic value read from a place: a bare local, `*p` when `p` is a known
-    /// reference, or `base.field` for a single field access.
     fn place_value(&self, p: &mir::Place<'tcx>) -> Sym {
         let local = p.local.as_usize();
         if p.projection.is_empty() {
@@ -166,13 +177,11 @@ impl<'tcx> Summary<'tcx> {
         } else if let [mir::ProjectionElem::Field(idx, _)] = &p.projection[..] {
             let i = idx.as_usize();
             match self.env[local].clone() {
-                // Reading a field off a composite we built: hand back that field's value.
                 Sym::Aggregate(elems) => elems.into_iter().nth(i).unwrap_or(Sym::Unknown),
                 Sym::Unknown => Sym::Unknown,
                 base => Sym::Field(Box::new(base), self.field_name(self.tys[local], i)),
             }
         } else if let [mir::ProjectionElem::Index(li)] = &p.projection[..] {
-            // `a[i]`: the index lives in its own local, often a known constant.
             index_into(self.env[local].clone(), self.env[li.as_usize()].clone())
         } else if let [mir::ProjectionElem::ConstantIndex { offset, from_end: false, .. }] =
             &p.projection[..]
@@ -183,8 +192,6 @@ impl<'tcx> Summary<'tcx> {
         }
     }
 
-    /// The source name of field `idx` of `base_ty`, falling back to its position for
-    /// tuples or anything that isn't a struct.
     fn field_name(&self, base_ty: ty::Ty<'tcx>, idx: usize) -> String {
         if let ty::Adt(def, _) = base_ty.kind() {
             if def.is_struct() {
@@ -197,8 +204,6 @@ impl<'tcx> Summary<'tcx> {
     }
 }
 
-/// Index into a value. A known aggregate at a known in-range constant resolves to that
-/// element; otherwise it stays the symbolic read `base[idx]`.
 fn index_into(base: Sym, idx: Sym) -> Sym {
     if let (Sym::Aggregate(elems), Sym::Const(i)) = (&base, &idx) {
         if let Ok(i) = usize::try_from(*i) {
@@ -213,57 +218,59 @@ fn index_into(base: Sym, idx: Sym) -> Sym {
     }
 }
 
-/// Build a binary expression, folding it to a constant when both sides are known.
 fn mk_bin(op: &mir::BinOp, l: Sym, r: Sym) -> Sym {
+    mk_bin_sym(bin_op(op), l, r)
+}
+
+fn mk_un(op: &mir::UnOp, v: Sym) -> Sym {
+    mk_un_sym(un_op(op), v)
+}
+
+fn mk_bin_sym(op: String, l: Sym, r: Sym) -> Sym {
     if let (Sym::Const(a), Sym::Const(b)) = (&l, &r) {
-        if let Some(v) = fold_bin(op, *a, *b) {
+        if let Some(v) = fold_sym(&op, *a, *b) {
             return Sym::Const(v);
         }
     }
-    Sym::Bin(bin_op(op), Box::new(l), Box::new(r))
+    Sym::Bin(op, Box::new(l), Box::new(r))
 }
 
-/// Build a unary expression, folding negation of a known constant.
-fn mk_un(op: &mir::UnOp, v: Sym) -> Sym {
-    if let (mir::UnOp::Neg, Sym::Const(a)) = (op, &v) {
-        if let Some(n) = a.checked_neg() {
-            return Sym::Const(n);
+fn mk_un_sym(op: String, v: Sym) -> Sym {
+    if op == "-" {
+        if let Sym::Const(a) = &v {
+            if let Some(n) = a.checked_neg() {
+                return Sym::Const(n);
+            }
         }
     }
-    Sym::Un(un_op(op), Box::new(v))
+    Sym::Un(op, Box::new(v))
 }
 
-/// Evaluate `a op b` over i128, or `None` when the result isn't well-defined here
-/// (overflow, divide-by-zero, an out-of-range shift, or an op we don't fold).
-/// Comparisons fold to 1/0. Widths aren't tracked, so wrapping isn't modelled.
-fn fold_bin(op: &mir::BinOp, a: i128, b: i128) -> Option<i128> {
-    use mir::BinOp::*;
+fn fold_sym(op: &str, a: i128, b: i128) -> Option<i128> {
     let shift = |amt: i128| (0..128).contains(&amt).then_some(amt as u32);
     match op {
-        Add | AddUnchecked | AddWithOverflow => a.checked_add(b),
-        Sub | SubUnchecked | SubWithOverflow => a.checked_sub(b),
-        Mul | MulUnchecked | MulWithOverflow => a.checked_mul(b),
-        Div => a.checked_div(b),
-        Rem => a.checked_rem(b),
-        BitXor => Some(a ^ b),
-        BitAnd => Some(a & b),
-        BitOr => Some(a | b),
-        Shl | ShlUnchecked => shift(b).and_then(|s| a.checked_shl(s)),
-        Shr | ShrUnchecked => shift(b).and_then(|s| a.checked_shr(s)),
-        Eq => Some((a == b) as i128),
-        Ne => Some((a != b) as i128),
-        Lt => Some((a < b) as i128),
-        Le => Some((a <= b) as i128),
-        Gt => Some((a > b) as i128),
-        Ge => Some((a >= b) as i128),
+        "+" => a.checked_add(b),
+        "-" => a.checked_sub(b),
+        "*" => a.checked_mul(b),
+        "/" => a.checked_div(b),
+        "%" => a.checked_rem(b),
+        "^" => Some(a ^ b),
+        "&" => Some(a & b),
+        "|" => Some(a | b),
+        "<<" => shift(b).and_then(|s| a.checked_shl(s)),
+        ">>" => shift(b).and_then(|s| a.checked_shr(s)),
+        "==" => Some((a == b) as i128),
+        "!=" => Some((a != b) as i128),
+        "<" => Some((a < b) as i128),
+        "<=" => Some((a <= b) as i128),
+        ">" => Some((a > b) as i128),
+        ">=" => Some((a >= b) as i128),
         _ => None,
     }
 }
 
 fn bin_op(op: &mir::BinOp) -> String {
     use mir::BinOp::*;
-    // Unchecked/WithOverflow variants are the same operation as their plain form at
-    // the source level, so they share a symbol.
     match op {
         Add | AddUnchecked | AddWithOverflow => "+",
         Sub | SubUnchecked | SubWithOverflow => "-",
@@ -294,8 +301,7 @@ fn un_op(op: &mir::UnOp) -> String {
     }
 }
 
-/// Source name of each local from MIR debug info, falling back to `_N`.
-fn local_names(body: &mir::Body<'_>) -> Vec<String> {
+pub(crate) fn local_names(body: &mir::Body<'_>) -> Vec<String> {
     let mut names: Vec<String> = (0..body.local_decls.len()).map(|i| format!("_{i}")).collect();
     for info in &body.var_debug_info {
         if let mir::VarDebugInfoContents::Place(p) = &info.value {
@@ -307,45 +313,231 @@ fn local_names(body: &mir::Body<'_>) -> Vec<String> {
     names
 }
 
-/// Why control reached a block, so a join can rebuild the branch it came from.
 #[derive(Clone)]
 enum Guard {
-    /// taken because the switch discriminant equalled this value
     Eq(Sym, i128),
-    /// taken because none of the listed values matched
     Otherwise(Sym),
 }
 
-pub fn run<'tcx>(tcx: TyCtxt<'tcx>, body: &mir::Body<'tcx>) {
-    let names = local_names(body);
-    let tys = body.local_decls.iter().map(|d| d.ty).collect();
-    let mut init = vec![Sym::Unknown; body.local_decls.len()];
-    for i in 1..=body.arg_count {
-        init[i] = Sym::Input(names[i].clone());
-    }
-    let mut s = Summary { tcx, typing_env: ty::TypingEnv::fully_monomorphized(), names, tys, env: init.clone() };
+pub struct FnSummary {
+    params: Vec<String>,
+    ret: Sym,
+    writes: Vec<(usize, Sym)>,
+    note: Option<&'static str>,
+}
 
-    // Walk the blocks in an order where each comes after its predecessors, merging
-    // branches back together at joins. A loop has no such order, so fall back to a
-    // straight-line walk and admit it's approximate.
-    match topo_order(body) {
-        Some(order) => match s.eval_cfg(body, &order, init) {
-            (val, false) => println!("  summary: returns {val}"),
-            (val, true) => println!("  summary: returns {val}  (approximate)"),
-        },
-        None => {
-            s.env = init;
-            walk::walk(body, &mut s);
-            println!("  summary: returns {}  (approximate: loops not modelled)", s.env[0]);
+impl std::fmt::Display for FnSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts: Vec<String> =
+            self.writes.iter().map(|(p, w)| format!("writes *{} = {}", self.params[*p], w)).collect();
+        parts.push(format!("returns {}", self.ret));
+        write!(f, "{}", parts.join("; "))?;
+        if let Some(note) = self.note {
+            write!(f, "  ({note})")?;
         }
+        Ok(())
     }
 }
 
-impl<'tcx> Summary<'tcx> {
-    /// Evaluate the body block by block in `order`, computing each block's entry from
-    /// its predecessors' exits and merging differing values into a branch. Returns the
-    /// final value of `_0` and whether any merge had to give up and approximate.
-    fn eval_cfg(&mut self, body: &mir::Body<'tcx>, order: &[mir::BasicBlock], init: Vec<Sym>) -> (Sym, bool) {
+pub fn summarize_crate<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    funcs: &[(DefId, &mir::Body<'tcx>)],
+) -> HashMap<DefId, FnSummary> {
+    let in_crate: HashSet<DefId> = funcs.iter().map(|(d, _)| *d).collect();
+    let bodies: HashMap<DefId, &mir::Body<'tcx>> = funcs.iter().map(|(d, b)| (*d, *b)).collect();
+
+    let mut graph: HashMap<DefId, Vec<DefId>> = HashMap::new();
+    for (d, body) in funcs {
+        graph.insert(*d, direct_callees(body, &in_crate));
+    }
+
+    let mut summaries = HashMap::new();
+    for d in call_order(funcs, &graph) {
+        let (fs, _) = summarize_fn(tcx, bodies[&d], &summaries);
+        summaries.insert(d, fs);
+    }
+    summaries
+}
+
+pub fn emit_dot<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    funcs: &[(DefId, &mir::Body<'tcx>)],
+    summaries: &HashMap<DefId, FnSummary>,
+) {
+    let in_crate: HashSet<DefId> = funcs.iter().map(|(d, _)| *d).collect();
+    let node: HashMap<DefId, usize> = funcs.iter().enumerate().map(|(i, (d, _))| (*d, i)).collect();
+
+    println!("digraph calls {{");
+    println!("  node [shape=box, fontname=monospace];");
+    for (i, (d, _)) in funcs.iter().enumerate() {
+        let fs = &summaries[d];
+        let head = escape(&format!("{}({})", tcx.def_path_str(*d), fs.params.join(", ")));
+        let summary = escape(&fs.to_string());
+        let style = if fs.note.is_some() { ", style=dashed" } else { "" };
+        println!("  n{i} [label=\"{head}\\n{summary}\"{style}];");
+    }
+    for (i, (_, body)) in funcs.iter().enumerate() {
+        for callee in direct_callees(body, &in_crate) {
+            println!("  n{i} -> n{};", node[&callee]);
+        }
+    }
+    println!("}}");
+}
+
+fn escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn summarize_fn<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &mir::Body<'tcx>,
+    summaries: &HashMap<DefId, FnSummary>,
+) -> (FnSummary, Vec<Sym>) {
+    let arg_count = body.arg_count;
+    let names0 = local_names(body);
+    let params: Vec<String> = (1..=arg_count).map(|i| names0[i].clone()).collect();
+    let tys0: Vec<ty::Ty<'tcx>> = body.local_decls.iter().map(|d| d.ty).collect();
+
+    let mut names = names0.clone();
+    let mut tys = tys0.clone();
+    let mut init = vec![Sym::Unknown; body.local_decls.len()];
+    let mut pointee_of = vec![None; arg_count + 1];
+    for i in 1..=arg_count {
+        if matches!(tys0[i].kind(), ty::Ref(..) | ty::RawPtr(..)) {
+            let slot = init.len();
+            init.push(Sym::Input(format!("*{}", names0[i])));
+            names.push(format!("*{}", names0[i]));
+            tys.push(tys0[i]);
+            init[i] = Sym::Ref { target: slot, name: names0[i].clone() };
+            pointee_of[i] = Some(slot);
+        } else {
+            init[i] = Sym::Input(names0[i].clone());
+        }
+    }
+
+    let mut s = Summary {
+        tcx,
+        typing_env: ty::TypingEnv::fully_monomorphized(),
+        names,
+        tys,
+        env: init.clone(),
+        summaries,
+        approx_call: false,
+    };
+
+    let (env, note) = match topo_order(body) {
+        Some(order) => {
+            let (env, imprecise) = s.eval_cfg(body, &order, init);
+            (env, (imprecise || s.approx_call).then_some("approximate"))
+        }
+        None => {
+            s.env = init;
+            walk::walk(body, &mut s);
+            (s.env.clone(), Some("approximate: loops not modelled"))
+        }
+    };
+
+    let mut writes = Vec::new();
+    for i in 1..=arg_count {
+        if let Some(slot) = pointee_of[i] {
+            let v = simplify(env[slot].clone());
+            if v != Sym::Input(format!("*{}", params[i - 1])) {
+                writes.push((i - 1, v));
+            }
+        }
+    }
+    let ret = simplify(env[0].clone());
+    (FnSummary { params, ret, writes, note }, env)
+}
+
+pub fn local_values<'tcx>(tcx: TyCtxt<'tcx>, funcs: &[(DefId, &mir::Body<'tcx>)]) -> HashMap<DefId, Vec<String>> {
+    let summaries = summarize_crate(tcx, funcs);
+    funcs
+        .iter()
+        .map(|(d, body)| {
+            let (_, env) = summarize_fn(tcx, body, &summaries);
+            let values = (0..body.local_decls.len()).map(|i| simplify(env[i].clone()).to_string()).collect();
+            (*d, values)
+        })
+        .collect()
+}
+
+pub(crate) fn callee_def_id(func: &mir::Operand<'_>) -> Option<DefId> {
+    if let mir::Operand::Constant(c) = func {
+        if let ty::FnDef(def_id, _) = c.const_.ty().kind() {
+            return Some(*def_id);
+        }
+    }
+    None
+}
+
+pub(crate) fn direct_callees(body: &mir::Body<'_>, in_crate: &HashSet<DefId>) -> Vec<DefId> {
+    let mut out = Vec::new();
+    for bb in body.basic_blocks.iter() {
+        if let mir::TerminatorKind::Call { func, .. } = &bb.terminator().kind {
+            if let Some(did) = callee_def_id(func) {
+                if in_crate.contains(&did) && !out.contains(&did) {
+                    out.push(did);
+                }
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn call_order(funcs: &[(DefId, &mir::Body<'_>)], graph: &HashMap<DefId, Vec<DefId>>) -> Vec<DefId> {
+    fn visit(d: DefId, graph: &HashMap<DefId, Vec<DefId>>, seen: &mut HashSet<DefId>, order: &mut Vec<DefId>) {
+        if !seen.insert(d) {
+            return;
+        }
+        for &callee in &graph[&d] {
+            visit(callee, graph, seen, order);
+        }
+        order.push(d);
+    }
+    let mut seen = HashSet::new();
+    let mut order = Vec::new();
+    for (d, _) in funcs {
+        visit(*d, graph, &mut seen, &mut order);
+    }
+    order
+}
+
+fn substitute(s: &Sym, binding: &HashMap<&str, &Sym>) -> Sym {
+    let sub = |x: &Sym| Box::new(substitute(x, binding));
+    match s {
+        Sym::Input(name) => binding.get(name.as_str()).map_or_else(|| s.clone(), |v| (*v).clone()),
+        Sym::Ref { .. } => Sym::Unknown,
+        Sym::Const(_) | Sym::Unknown => s.clone(),
+        Sym::Bin(op, l, r) => Sym::Bin(op.clone(), sub(l), sub(r)),
+        Sym::Un(op, v) => Sym::Un(op.clone(), sub(v)),
+        Sym::Cond(c, t, e) => Sym::Cond(sub(c), sub(t), sub(e)),
+        Sym::Call(name, args) => Sym::Call(name.clone(), args.iter().map(|a| substitute(a, binding)).collect()),
+        Sym::Field(base, name) => Sym::Field(sub(base), name.clone()),
+        Sym::Aggregate(elems) => Sym::Aggregate(elems.iter().map(|e| substitute(e, binding)).collect()),
+        Sym::Index(base, idx) => Sym::Index(sub(base), sub(idx)),
+    }
+}
+
+fn simplify(s: Sym) -> Sym {
+    match s {
+        Sym::Bin(op, l, r) => mk_bin_sym(op, simplify(*l), simplify(*r)),
+        Sym::Un(op, v) => mk_un_sym(op, simplify(*v)),
+        Sym::Cond(c, t, e) => match simplify(*c) {
+            Sym::Const(0) => simplify(*e),
+            Sym::Const(_) => simplify(*t),
+            c => Sym::Cond(Box::new(c), Box::new(simplify(*t)), Box::new(simplify(*e))),
+        },
+        Sym::Index(base, idx) => index_into(simplify(*base), simplify(*idx)),
+        Sym::Field(base, name) => Sym::Field(Box::new(simplify(*base)), name),
+        Sym::Aggregate(elems) => Sym::Aggregate(elems.into_iter().map(simplify).collect()),
+        Sym::Call(name, args) => Sym::Call(name, args.into_iter().map(simplify).collect()),
+        other => other,
+    }
+}
+
+impl<'a, 'tcx> Summary<'a, 'tcx> {
+    fn eval_cfg(&mut self, body: &mir::Body<'tcx>, order: &[mir::BasicBlock], init: Vec<Sym>) -> (Vec<Sym>, bool) {
         let preds = body.basic_blocks.predecessors();
         let n = body.basic_blocks.len();
         let mut exit: Vec<Option<Vec<Sym>>> = vec![None; n];
@@ -384,8 +576,6 @@ impl<'tcx> Summary<'tcx> {
                 }
                 mir::TerminatorKind::Return => returns.push(self.env.clone()),
                 _ => {
-                    // Carry this block's guard down a straight chain so it survives to
-                    // the next join; a join sets its own guard, so don't overwrite it.
                     for succ in term.successors() {
                         if preds[succ].len() == 1 {
                             guard[succ.as_usize()] = guard[bb.as_usize()].clone();
@@ -396,16 +586,13 @@ impl<'tcx> Summary<'tcx> {
         }
 
         match returns.as_slice() {
-            [only] => (only[0].clone(), imprecise),
-            [first, rest @ ..] if rest.iter().all(|e| e[0] == first[0]) => (first[0].clone(), imprecise),
-            _ => (Sym::Unknown, true),
+            [only] => (only.clone(), imprecise),
+            [first, rest @ ..] if rest.iter().all(|e| e[0] == first[0]) => (first.clone(), imprecise),
+            _ => (vec![Sym::Unknown; init.len()], true),
         }
     }
 }
 
-/// Merge the exit states of several predecessors into one entry state. Where they
-/// agree the value carries through; where exactly two disagree and their guards are
-/// the two sides of one branch, rebuild that branch. Anything else gives up.
 fn merge(preds: &[mir::BasicBlock], exit: &[Option<Vec<Sym>>], guard: &[Option<Guard>]) -> (Vec<Sym>, bool) {
     let avail: Vec<mir::BasicBlock> =
         preds.iter().copied().filter(|p| exit[p.as_usize()].is_some()).collect();
@@ -432,18 +619,13 @@ fn merge(preds: &[mir::BasicBlock], exit: &[Option<Vec<Sym>>], guard: &[Option<G
     (out, imprecise)
 }
 
-/// Rebuild `if cond { .. } else { .. }` from the two arms of a branch, given each
-/// arm's value and the guard that selected it. `None` if the guards aren't a matching
-/// equal/otherwise pair on one discriminant.
 fn branch_value(va: &Sym, ga: Option<&Guard>, vb: &Sym, gb: Option<&Guard>) -> Option<Sym> {
-    // Order the arms so `eq` is the `discr == value` side and `oth` is the fallthrough.
     let (d, val, eq_val, oth_val) = match (ga?, gb?) {
         (Guard::Eq(d1, v), Guard::Otherwise(d2)) if d1 == d2 => (d1, *v, va, vb),
         (Guard::Otherwise(d2), Guard::Eq(d1, v)) if d1 == d2 => (d1, *v, vb, va),
         _ => return None,
     };
     if val == 0 {
-        // A bool: `discr == 0` is the `else`, so the discriminant itself is the test.
         Some(Sym::Cond(Box::new(d.clone()), Box::new(oth_val.clone()), Box::new(eq_val.clone())))
     } else {
         let cond = Sym::Bin("==".into(), Box::new(d.clone()), Box::new(Sym::Const(val)));
@@ -451,8 +633,10 @@ fn branch_value(va: &Sym, ga: Option<&Guard>, vb: &Sym, gb: Option<&Guard>) -> O
     }
 }
 
-/// Order the blocks so every block comes after all its predecessors (reverse
-/// postorder). Returns `None` if there's a back edge, i.e. a loop.
+pub(crate) fn has_loop(body: &mir::Body<'_>) -> bool {
+    topo_order(body).is_none()
+}
+
 fn topo_order(body: &mir::Body<'_>) -> Option<Vec<mir::BasicBlock>> {
     #[derive(Clone, Copy, PartialEq)]
     enum Mark {
@@ -475,7 +659,7 @@ fn topo_order(body: &mir::Body<'_>) -> Option<Vec<mir::BasicBlock>> {
                     mark[s.as_usize()] = Some(Mark::Open);
                     stack.push((s, 0));
                 }
-                Some(Mark::Open) => return None, // back edge: a loop
+                Some(Mark::Open) => return None,
                 Some(Mark::Done) => {}
             }
         } else {

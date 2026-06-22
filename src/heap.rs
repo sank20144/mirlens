@@ -108,6 +108,7 @@ struct State<'tcx> {
     block_step: Vec<Step>,
     heap: Vec<Cell>,
     vars: Vec<Option<Ownership>>,
+    read_params: Vec<bool>,
     step: Step,
     ub: Vec<String>,
 }
@@ -119,6 +120,7 @@ enum Ret {
 }
 
 pub struct HeapSummary {
+    reads: Vec<usize>,
     writes: Vec<(usize, Val)>,
     ret: Ret,
 }
@@ -167,6 +169,11 @@ impl<'tcx> State<'tcx> {
     }
 
     fn instantiate(&mut self, summary: &HeapSummary, actuals: &[(Val, Option<usize>)], dest: usize) {
+        for &param in &summary.reads {
+            if let Some(rl) = actuals.get(param).and_then(|a| a.1) {
+                self.read_through(rl);
+            }
+        }
         for (param, wv) in &summary.writes {
             if let Some(rl) = actuals.get(*param).and_then(|a| a.1) {
                 let v = self.subst(wv, actuals);
@@ -391,6 +398,9 @@ impl<'tcx> State<'tcx> {
     }
 
     fn read_through(&mut self, p: usize) -> Val {
+        if (1..=self.arg_count).contains(&p) && self.refs[p] {
+            self.read_params[p] = true;
+        }
         let Some(own) = self.vars[p] else { return Val::Unknown };
         let a = own.addr();
         self.expire(a);
@@ -595,6 +605,7 @@ fn new_state<'tcx>(tcx: TyCtxt<'tcx>, body: &mir::Body<'tcx>) -> State<'tcx> {
         block_step: block_steps(body),
         heap: Vec::new(),
         vars: vec![None; n],
+        read_params: vec![false; n],
         step: 0,
         ub: Vec::new(),
     };
@@ -772,9 +783,13 @@ fn side_by_side(left: &[String], right: &[String]) -> String {
 
 fn extract_summary(s: &State<'_>, ret: Val) -> HeapSummary {
     let is_ref = |o: &Ownership| matches!(o, Ownership::SharedRef(..) | Ownership::MutRef(..));
+    let mut reads = Vec::new();
     let mut writes = Vec::new();
     for i in 1..=s.arg_count {
         if s.refs[i] {
+            if s.read_params[i] {
+                reads.push(i - 1);
+            }
             if let Some(own) = s.vars[i] {
                 let v = &s.heap[own.addr()].value;
                 if !matches!(v, Val::In(j) if *j == i - 1) {
@@ -789,7 +804,7 @@ fn extract_summary(s: &State<'_>, ret: Val) -> HeapSummary {
             (s.refs[i] && is_ref(&v0) && v0.addr() == vi.addr()).then_some(Ret::Ref(i - 1))
         })
         .unwrap_or(Ret::Val(ret));
-    HeapSummary { writes, ret }
+    HeapSummary { reads, writes, ret }
 }
 
 impl<'tcx> State<'tcx> {

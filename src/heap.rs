@@ -2,7 +2,8 @@ use rustc_hir::def_id::DefId;
 use rustc_middle::mir;
 use rustc_middle::ty::{self, TyCtxt};
 
-use crate::summary;
+use crate::mir_util;
+use crate::walk;
 
 type Addr = usize;
 type Step = usize;
@@ -72,8 +73,6 @@ impl LocState {
 
 #[derive(Clone)]
 enum Val {
-    Int(i128),
-    Bool(bool),
     Unit,
     Unknown,
     Param(usize),
@@ -83,8 +82,6 @@ enum Val {
 impl std::fmt::Display for Val {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Val::Int(v) => write!(f, "{v}"),
-            Val::Bool(b) => write!(f, "{b}"),
             Val::Unit => write!(f, "()"),
             Val::Unknown => write!(f, "?"),
             Val::Param(n) => write!(f, "arg{n}"),
@@ -103,7 +100,6 @@ struct Cell {
 #[derive(Clone)]
 struct State<'tcx> {
     tcx: TyCtxt<'tcx>,
-    typing_env: ty::TypingEnv<'tcx>,
     names: Vec<String>,
     muts: Vec<bool>,
     refs: Vec<bool>,
@@ -411,20 +407,7 @@ impl<'tcx> State<'tcx> {
 
     fn eval(&mut self, rv: &mir::Rvalue<'tcx>) -> Val {
         match rv {
-            mir::Rvalue::Use(op, _) => self.operand(op),
-            mir::Rvalue::Cast(_, op, _) => self.operand(op),
-            mir::Rvalue::UnaryOp(op, operand) => match (op, self.operand(operand)) {
-                (mir::UnOp::Neg, Val::Int(a)) => a.checked_neg().map_or(Val::Unknown, Val::Int),
-                (mir::UnOp::Not, Val::Bool(a)) => Val::Bool(!a),
-                _ => Val::Unknown,
-            },
-            mir::Rvalue::BinaryOp(op, b) => {
-                let (l, r) = &**b;
-                match (self.operand(l), self.operand(r)) {
-                    (Val::Int(a), Val::Int(c)) => fold(op, a, c),
-                    _ => Val::Unknown,
-                }
-            }
+            mir::Rvalue::Use(op, _) | mir::Rvalue::Cast(_, op, _) => self.operand(op),
             _ => Val::Unknown,
         }
     }
@@ -432,39 +415,9 @@ impl<'tcx> State<'tcx> {
     fn operand(&mut self, op: &mir::Operand<'tcx>) -> Val {
         match op {
             mir::Operand::Copy(p) | mir::Operand::Move(p) => self.read_place(p),
-            mir::Operand::Constant(c) => {
-                let ty = c.const_.ty();
-                match c.const_.try_eval_bits(self.tcx, self.typing_env) {
-                    Some(bits) if ty.is_bool() => Val::Bool(bits != 0),
-                    Some(bits) => Val::Int(bits as i128),
-                    None if ty.is_unit() => Val::Unit,
-                    None => Val::Unknown,
-                }
-            }
+            mir::Operand::Constant(c) if c.const_.ty().is_unit() => Val::Unit,
             _ => Val::Unknown,
         }
-    }
-}
-
-fn fold(op: &mir::BinOp, a: i128, b: i128) -> Val {
-    use mir::BinOp::*;
-    let int = |o: Option<i128>| o.map_or(Val::Unknown, Val::Int);
-    match op {
-        Add | AddUnchecked => int(a.checked_add(b)),
-        Sub | SubUnchecked => int(a.checked_sub(b)),
-        Mul | MulUnchecked => int(a.checked_mul(b)),
-        Div => int(a.checked_div(b)),
-        Rem => int(a.checked_rem(b)),
-        BitXor => Val::Int(a ^ b),
-        BitAnd => Val::Int(a & b),
-        BitOr => Val::Int(a | b),
-        Eq => Val::Bool(a == b),
-        Ne => Val::Bool(a != b),
-        Lt => Val::Bool(a < b),
-        Le => Val::Bool(a <= b),
-        Gt => Val::Bool(a > b),
-        Ge => Val::Bool(a >= b),
-        _ => Val::Unknown,
     }
 }
 
@@ -557,11 +510,10 @@ fn single_deref(p: &mir::Place<'_>) -> bool {
 }
 
 pub fn analyze_crate<'tcx>(tcx: TyCtxt<'tcx>, funcs: &[(DefId, &mir::Body<'tcx>)]) {
-    let sym = summary::local_values(tcx, funcs);
     let summaries = build_summaries(tcx, funcs);
     for (d, body) in funcs {
         let (paths, looped) = analyze_paths(tcx, body, &summaries);
-        report_fn(tcx, *d, &paths, looped, sym.get(d));
+        report_fn(tcx, *d, body, &paths, looped);
     }
 }
 
@@ -570,17 +522,16 @@ pub fn emit_dot<'tcx>(tcx: TyCtxt<'tcx>, funcs: &[(DefId, &mir::Body<'tcx>)]) {
     let index: std::collections::HashMap<DefId, usize> =
         funcs.iter().enumerate().map(|(i, (d, _))| (*d, i)).collect();
 
-    let sym = summary::local_values(tcx, funcs);
     let summaries = build_summaries(tcx, funcs);
     println!("digraph heap {{");
     println!("  compound=true;");
     println!("  node [shape=box, fontname=monospace];");
     for (i, (d, body)) in funcs.iter().enumerate() {
         let (paths, looped) = analyze_paths(tcx, body, &summaries);
-        dot_fn(tcx, i, *d, &paths, looped, sym.get(d));
+        dot_fn(tcx, i, *d, &paths, looped);
     }
     for (i, (_, body)) in funcs.iter().enumerate() {
-        for callee in summary::direct_callees(body, &in_crate) {
+        for callee in mir_util::direct_callees(body, &in_crate) {
             let j = index[&callee];
             println!("  h{i} -> h{j} [ltail=cluster_{i}, lhead=cluster_{j}];");
         }
@@ -597,46 +548,45 @@ fn build_summaries<'tcx>(
 
     let mut graph = std::collections::HashMap::new();
     for (d, body) in funcs {
-        graph.insert(*d, summary::direct_callees(body, &in_crate));
+        graph.insert(*d, mir_util::direct_callees(body, &in_crate));
     }
 
     let mut summaries = std::collections::HashMap::new();
-    for d in summary::call_order(funcs, &graph) {
+    for d in mir_util::call_order(funcs, &graph) {
         let (_, _, sum) = analyze_fn(tcx, bodies[&d], &summaries);
         summaries.insert(d, sum);
     }
     summaries
 }
 
-fn dot_fn(tcx: TyCtxt<'_>, idx: usize, def_id: DefId, paths: &[Path<'_>], looped: bool, sym: Option<&Vec<String>>) {
+fn dot_fn(tcx: TyCtxt<'_>, idx: usize, def_id: DefId, paths: &[Path<'_>], looped: bool) {
     let sig = format!("{}({})", tcx.def_path_str(def_id), paths[0].1.params_str());
     if paths.len() == 1 {
         let note = looped.then_some("approximate: loops not modelled");
-        paths[0].1.dot_cluster(idx, &sig, &paths[0].2, sym, note);
+        paths[0].1.dot_cluster(idx, &sig, note);
         return;
     }
     println!("  subgraph cluster_{idx} {{");
     println!("    label=\"{}\";", esc(&sig));
-    println!("    h{idx} [shape=box, style=bold, label=\"returns {}\"];", esc(&recombine(paths, sym)));
-    for (p, (guards, state, _)) in paths.iter().enumerate() {
-        let cond = state.guard_cond(guards, sym);
+    println!("    h{idx} [shape=box, style=bold, label=\"{}\"];", esc(&sig));
+    for (p, (guards, state)) in paths.iter().enumerate() {
+        let cond = state.guard_cond(guards);
         let cond = if cond.is_empty() { "default".to_string() } else { cond };
         println!("    subgraph cluster_{idx}_{p} {{");
         println!("      label=\"[{}]\\n{}\";", esc(&cond), esc(&state.ub_label()));
-        state.dot_nodes(idx, Some(p), None);
+        state.dot_nodes(idx, Some(p));
         println!("    }}");
     }
     println!("  }}");
 }
 
 fn new_state<'tcx>(tcx: TyCtxt<'tcx>, body: &mir::Body<'tcx>) -> State<'tcx> {
-    let names = summary::local_names(body);
+    let names = mir_util::local_names(body);
     let muts = body.local_decls.iter().map(|d| matches!(d.mutability, mir::Mutability::Mut)).collect();
     let refs = body.local_decls.iter().map(|d| matches!(d.ty.kind(), ty::Ref(..) | ty::RawPtr(..))).collect();
     let n = body.local_decls.len();
     let mut s = State {
         tcx,
-        typing_env: ty::TypingEnv::fully_monomorphized(),
         names,
         muts,
         refs,
@@ -686,7 +636,7 @@ impl<'tcx> State<'tcx> {
         let ret = match &data.terminator().kind {
             mir::TerminatorKind::Call { func, args, destination, .. } if destination.projection.is_empty() => {
                 let dest = destination.local.as_usize();
-                match summary::callee_def_id(func).and_then(|d| summaries.get(&d)) {
+                match mir_util::callee_def_id(func).and_then(|d| summaries.get(&d)) {
                     Some(sum) => {
                         let actuals: Vec<(Val, Option<usize>)> = args
                             .iter()
@@ -733,7 +683,7 @@ struct Guard {
     is_bool: bool,
 }
 
-type Path<'tcx> = (Vec<Guard>, State<'tcx>, Val);
+type Path<'tcx> = (Vec<Guard>, State<'tcx>);
 
 fn analyze_paths<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -741,14 +691,11 @@ fn analyze_paths<'tcx>(
     summaries: &std::collections::HashMap<DefId, HeapSummary>,
 ) -> (Vec<Path<'tcx>>, bool) {
     let mut state = new_state(tcx, body);
-    if summary::has_loop(body) {
-        let mut ret = Val::Unit;
+    if mir_util::has_loop(body) {
         for (bb, _) in body.basic_blocks.iter_enumerated() {
-            if let Some(r) = state.run_block_body(body, bb, summaries) {
-                ret = r;
-            }
+            state.run_block_body(body, bb, summaries);
         }
-        return (vec![(Vec::new(), state, ret)], true);
+        return (vec![(Vec::new(), state)], true);
     }
     let mut out = Vec::new();
     walk_paths(state, mir::START_BLOCK, Vec::new(), body, summaries, &mut out);
@@ -763,10 +710,10 @@ fn walk_paths<'tcx>(
     summaries: &std::collections::HashMap<DefId, HeapSummary>,
     out: &mut Vec<Path<'tcx>>,
 ) {
-    let ret = state.run_block_body(body, bb, summaries);
+    state.run_block_body(body, bb, summaries);
     let term = body.basic_blocks[bb].terminator();
     match &term.kind {
-        mir::TerminatorKind::Return => out.push((guards, state, ret.unwrap_or(Val::Unit))),
+        mir::TerminatorKind::Return => out.push((guards, state)),
         mir::TerminatorKind::SwitchInt { discr, targets } => {
             let discr_local = operand_locals(discr);
             let is_bool = discr.ty(&body.local_decls, state.tcx).is_bool();
@@ -781,36 +728,46 @@ fn walk_paths<'tcx>(
         }
         _ => match term.successors().next() {
             Some(t) => walk_paths(state, t, guards, body, summaries, out),
-            None => out.push((guards, state, ret.unwrap_or(Val::Unit))),
+            None => out.push((guards, state)),
         },
     }
 }
 
-fn recombine(paths: &[Path<'_>], sym: Option<&Vec<String>>) -> String {
-    let texts: Vec<String> = paths.iter().map(|(_, st, r)| st.fmt_val(r)).collect();
-    if texts.windows(2).all(|w| w[0] == w[1]) {
-        return texts[0].clone();
-    }
-    let (_, last_st, last_ret) = paths.last().unwrap();
-    let mut acc = last_st.fmt_val(last_ret);
-    for (g, st, r) in paths[..paths.len() - 1].iter().rev() {
-        acc = format!("if {} {{ {} }} else {{ {} }}", st.guard_cond(g, sym), st.fmt_val(r), acc);
-    }
-    format!("({acc})")
-}
-
-fn report_fn(tcx: TyCtxt<'_>, def_id: DefId, paths: &[Path<'_>], looped: bool, sym: Option<&Vec<String>>) {
+fn report_fn(tcx: TyCtxt<'_>, def_id: DefId, body: &mir::Body<'_>, paths: &[Path<'_>], looped: bool) {
     println!("\nfn {}", tcx.def_path_str(def_id));
+    let mut src = source_lines(tcx, body);
+    let mut mir = walk::body_lines(body);
+    src.insert(0, "[rust]".into());
+    mir.insert(0, "[mir]".into());
+    print!("{}", side_by_side(&src, &mir));
     if paths.len() == 1 {
         let note = looped.then_some("approximate: loops not modelled");
-        paths[0].1.report_body(&paths[0].2, sym, "", note);
+        paths[0].1.report_body("", note);
         return;
     }
-    for (guards, state, ret) in paths {
-        println!("  path [{}]:", state.guard_cond(guards, sym));
-        state.report_body(ret, None, "  ", None);
+    for (guards, state) in paths {
+        println!("  path [{}]:", state.guard_cond(guards));
+        state.report_body("  ", None);
     }
-    println!("  summary: returns {}", recombine(paths, sym));
+}
+
+fn source_lines(tcx: TyCtxt<'_>, body: &mir::Body<'_>) -> Vec<String> {
+    match tcx.sess.source_map().span_to_snippet(body.span) {
+        Ok(s) => s.lines().map(str::to_string).collect(),
+        Err(_) => vec!["<source unavailable>".into()],
+    }
+}
+
+fn side_by_side(left: &[String], right: &[String]) -> String {
+    let w = left.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let mut out = String::new();
+    for i in 0..left.len().max(right.len()) {
+        let l = left.get(i).map(String::as_str).unwrap_or("");
+        let r = right.get(i).map(String::as_str).unwrap_or("");
+        let pad = " ".repeat(w - l.chars().count());
+        out.push_str(&format!("  {l}{pad}  │  {r}\n"));
+    }
+    out
 }
 
 fn extract_summary(s: &State<'_>, ret: Val) -> HeapSummary {
@@ -836,37 +793,17 @@ fn extract_summary(s: &State<'_>, ret: Val) -> HeapSummary {
 }
 
 impl<'tcx> State<'tcx> {
-    fn owner_of(&self, a: Addr) -> Option<usize> {
-        (0..self.vars.len()).find(|&i| {
-            matches!(self.vars[i], Some(Ownership::Owned(x, _)) | Some(Ownership::MutOwned(x, _)) if x == a)
-        })
+    fn cell_text(&self, a: Addr) -> String {
+        self.fmt_val(&self.heap[a].value)
     }
 
-    fn cell_text(&self, a: Addr, sym: Option<&Vec<String>>) -> String {
-        match (sym, self.owner_of(a)) {
-            (Some(s), Some(l)) => s.get(l).cloned().unwrap_or_else(|| self.fmt_val(&self.heap[a].value)),
-            _ => self.fmt_val(&self.heap[a].value),
-        }
+    fn guard_cond(&self, guards: &[Guard]) -> String {
+        guards.iter().map(|g| self.guard_one(g)).collect::<Vec<_>>().join(" && ")
     }
 
-    fn ret_text(&self, ret: &Val, sym: Option<&Vec<String>>) -> String {
-        match sym.and_then(|s| s.first()) {
-            Some(v) if v != "?" => v.clone(),
-            _ => self.fmt_val(ret),
-        }
-    }
-
-    fn guard_cond(&self, guards: &[Guard], sym: Option<&Vec<String>>) -> String {
-        guards.iter().map(|g| self.guard_one(g, sym)).collect::<Vec<_>>().join(" && ")
-    }
-
-    fn guard_one(&self, g: &Guard, sym: Option<&Vec<String>>) -> String {
+    fn guard_one(&self, g: &Guard) -> String {
         let name = match g.discr {
-            Some(l) => sym
-                .and_then(|s| s.get(l))
-                .filter(|v| v.as_str() != "?")
-                .cloned()
-                .unwrap_or_else(|| self.names.get(l).cloned().unwrap_or_else(|| "?".into())),
+            Some(l) => self.names.get(l).cloned().unwrap_or_else(|| "?".into()),
             None => "?".into(),
         };
         match (g.is_bool, g.value) {
@@ -877,7 +814,7 @@ impl<'tcx> State<'tcx> {
         }
     }
 
-    fn report_body(&self, ret: &Val, sym: Option<&Vec<String>>, indent: &str, note: Option<&str>) {
+    fn report_body(&self, indent: &str, note: Option<&str>) {
         let shown: Vec<usize> =
             (0..self.vars.len()).filter(|&i| self.vars[i].is_some() && !self.names[i].starts_with('_')).collect();
         let mut addrs: Vec<Addr> = shown.iter().filter_map(|&i| self.vars[i].map(|o| o.addr())).collect();
@@ -892,16 +829,17 @@ impl<'tcx> State<'tcx> {
         }
         println!("{indent}  heap:");
         for a in addrs {
-            println!("{indent}    a{a} = {}  ({})", self.cell_text(a, sym), self.heap[a].state.label());
+            println!("{indent}    a{a} = {}  ({})", self.cell_text(a), self.heap[a].state.label());
         }
-        let note = note.map(|n| format!("  ({n})")).unwrap_or_default();
-        println!("{indent}  summary: returns {}{note}", self.ret_text(ret, sym));
         if self.ub.is_empty() {
-            println!("{indent}  UB: none");
+            println!("{indent}  safety: ok");
         } else {
             for msg in &self.ub {
-                println!("{indent}  UB: {msg}");
+                println!("{indent}  safety: {msg}");
             }
+        }
+        if let Some(n) = note {
+            println!("{indent}  ({n})");
         }
     }
 
@@ -911,13 +849,13 @@ impl<'tcx> State<'tcx> {
 
     fn ub_label(&self) -> String {
         if self.ub.is_empty() {
-            "UB: none".to_string()
+            "safety: ok".to_string()
         } else {
-            self.ub.iter().map(|m| format!("UB: {m}")).collect::<Vec<_>>().join("\\n")
+            self.ub.iter().map(|m| format!("safety: {m}")).collect::<Vec<_>>().join("\\n")
         }
     }
 
-    fn dot_nodes(&self, idx: usize, path: Option<usize>, sym: Option<&Vec<String>>) {
+    fn dot_nodes(&self, idx: usize, path: Option<usize>) {
         let shown: Vec<usize> =
             (0..self.vars.len()).filter(|&i| self.vars[i].is_some() && !self.names[i].starts_with('_')).collect();
         let mut addrs: Vec<Addr> = shown.iter().filter_map(|&i| self.vars[i].map(|o| o.addr())).collect();
@@ -933,7 +871,7 @@ impl<'tcx> State<'tcx> {
             None => format!("v{idx}_{i}"),
         };
         for &a in &addrs {
-            println!("    {} [label=\"a{a} = {}\\n{}\"];", cid(a), esc(&self.cell_text(a, sym)), esc(&self.heap[a].state.label()));
+            println!("    {} [label=\"a{a} = {}\\n{}\"];", cid(a), esc(&self.cell_text(a)), esc(&self.heap[a].state.label()));
         }
         for &i in &shown {
             let own = self.vars[i].unwrap();
@@ -944,17 +882,16 @@ impl<'tcx> State<'tcx> {
         }
     }
 
-    fn dot_cluster(&self, idx: usize, sig: &str, ret: &Val, sym: Option<&Vec<String>>, note: Option<&str>) {
+    fn dot_cluster(&self, idx: usize, sig: &str, note: Option<&str>) {
         let ret_note = note.map(|n| format!("\\n({n})")).unwrap_or_default();
         println!("  subgraph cluster_{idx} {{");
         println!(
-            "    h{idx} [shape=box, style=bold, label=\"{}\\nreturns {}{}\\n{}\"];",
+            "    h{idx} [shape=box, style=bold, label=\"{}{}\\n{}\"];",
             esc(sig),
-            esc(&self.ret_text(ret, sym)),
             ret_note,
             esc(&self.ub_label())
         );
-        self.dot_nodes(idx, None, sym);
+        self.dot_nodes(idx, None);
         println!("  }}");
     }
 }

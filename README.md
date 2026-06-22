@@ -1,25 +1,7 @@
 # mirlens
 
 A custom `rustc` driver that reads the MIR of every function in a crate and runs
-a small analysis over it.
-
-For each function it:
-
-- **walks the MIR** — basic blocks, their statements and terminator, down into
-  the rvalues and operands (`src/walk.rs`), and
-- **prints a rough symbolic summary** — gives each parameter a symbolic value
-  (named from debug info) and reports what the function returns in terms of those
-  inputs: it folds in constants, builds arithmetic, comparison, bitwise and unary
-  expressions, follows simple references — `&x`, and reads/writes through `*p` — builds
-  struct and tuple values and reads their fields back as `s.field`, indexes arrays at a
-  known position (`a[0]`), and records calls as `f(arg, ...)` (`src/summary.rs`).
-
-So `fn f(x: i32) -> i32 { x * 2 + 1 }` reports `returns ((x * 2) + 1)`, and
-`fn h() { let mut x = 1; let r = &mut x; *r = 7; x }` reports `returns 7`.
-
-The driver runs the compiler as a library (`rustc_private`) and stops right after
-analysis, so it never produces a binary. It keeps the MIR unoptimized with UB
-checks preserved, so the MIR stays faithful to what the source says.
+a heap/borrow safety model over it.
 
 ## Build
 
@@ -30,51 +12,22 @@ up automatically.
 
 ## Run
 
-Pass a Rust file plus the usual rustc flags:
+Pass a Rust file plus the usual rustc flags.
+
+Plain MIR dump (no analysis):
 
     target/debug/mirlens --edition 2021 --crate-type lib path/to/file.rs
 
-For a file containing `pub fn f(x: i32) -> i32 { x * 2 + 1 }` it prints the walk
-followed by the summary line:
+Heap model. For each function it prints the Rust source, its MIR beside it, and the resulting heap (variables, cells, borrow state) per control-flow path:
 
-    fn f
-      let mut _0: i32
-      let _1: i32
-      ...
-      bb0:
-        _2 =
-          Mul
-          move _3
-          const Val(Scalar(0x00000002), i32)
-        ...
-        return
-      summary: returns ((x * 2) + 1)
+    target/debug/mirlens --heap --edition 2021 --crate-type lib samples/ref_write.rs
 
-The `summary:` line at the end is what each function reduces to.
+Add `--dot` to draw the heaps and call graph as Graphviz, then pipe to `dot`:
 
-## Limitations
-
-Branches are followed: the blocks are visited so each comes after its predecessors,
-and where two arms of an `if` assign different values they're merged back into a
-conditional, so `if c { 1 } else { 2 }` reports `(if c { 1 } else { 2 })`. A merge it
-can't express as a single branch (say a `match` with several arms) falls back to `?`
-and the summary is tagged `(approximate)`. Loops have no such ordering, so a function
-that loops is walked straight through and tagged `(approximate: loops not modelled)`.
+    target/debug/mirlens --heap --dot --edition 2021 --crate-type lib samples/ref_write.rs | dot -Tsvg -o heap.svg
 
 ## Samples
 
-`samples/` holds small programs to try, each with a header comment noting its
-expected summary. Run one, or all of them:
+`samples/` holds small programs to try. Run one, or all of them:
 
-    target/debug/mirlens --edition 2021 --crate-type lib samples/arithmetic.rs
-
-    for s in samples/*.rs; do target/debug/mirlens --edition 2021 --crate-type lib "$s"; done
-
-## How it's put together
-
-- `src/main.rs` — the driver: hooks rustc and hands each function's MIR to `analyze`.
-- `src/walk.rs` — a `Visitor` trait and a `walk` that drives it over a body; the
-  default `Printer` is what prints the MIR.
-- `src/summary.rs` — a `Visitor` that builds a symbolic value per local.
-
-Implement `Visitor` and call `walk` to plug in your own analysis.
+    for s in samples/*.rs; do target/debug/mirlens --heap --edition 2021 --crate-type lib "$s"; done

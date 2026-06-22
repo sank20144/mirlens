@@ -14,7 +14,7 @@ use rustc_interface::interface;
 use rustc_middle::ty::TyCtxt;
 
 mod heap;
-mod summary;
+mod mir_util;
 mod walk;
 
 struct Driver {
@@ -42,16 +42,9 @@ impl Callbacks for Driver {
             } else {
                 heap::analyze_crate(tcx, &funcs);
             }
-            return Compilation::Stop;
-        }
-
-        let summaries = summary::summarize_crate(tcx, &funcs);
-        if self.dot {
-            summary::emit_dot(tcx, &funcs, &summaries);
         } else {
             for (def_id, body) in &funcs {
                 walk::body(tcx, *def_id, body);
-                println!("  summary: {}", summaries[def_id]);
             }
         }
         Compilation::Stop

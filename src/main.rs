@@ -13,11 +13,13 @@ use rustc_hir::def::DefKind;
 use rustc_interface::interface;
 use rustc_middle::ty::TyCtxt;
 
+mod heap;
 mod summary;
 mod walk;
 
 struct Driver {
     dot: bool,
+    heap: bool,
 }
 
 impl Callbacks for Driver {
@@ -32,6 +34,15 @@ impl Callbacks for Driver {
                 continue;
             }
             funcs.push((def_id, tcx.optimized_mir(def_id)));
+        }
+
+        if self.heap {
+            if self.dot {
+                heap::emit_dot(tcx, &funcs);
+            } else {
+                heap::analyze_crate(tcx, &funcs);
+            }
+            return Compilation::Stop;
         }
 
         let summaries = summary::summarize_crate(tcx, &funcs);
@@ -56,7 +67,8 @@ fn sysroot() -> String {
 fn main() {
     let mut args: Vec<String> = std::env::args().collect();
     let dot = args.iter().any(|a| a == "--dot");
-    args.retain(|a| a != "--dot");
+    let heap = args.iter().any(|a| a == "--heap");
+    args.retain(|a| a != "--dot" && a != "--heap");
 
     if !args.iter().any(|a| a.starts_with("--sysroot")) {
         args.push("--sysroot".into());
@@ -69,5 +81,5 @@ fn main() {
     args.push("-Zub-checks=yes".into());
     args.push("-Zalways-encode-mir".into());
 
-    rustc_driver::run_compiler(&args, &mut Driver { dot });
+    rustc_driver::run_compiler(&args, &mut Driver { dot, heap });
 }
